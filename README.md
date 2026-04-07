@@ -1413,7 +1413,7 @@ Contributions are welcome! Please:
 For questions or issues:
 
 - Open an issue on GitHub
-- Email: your.email@example.com
+- Email: aditya.men2005@gmail.com
 
 ---
 
