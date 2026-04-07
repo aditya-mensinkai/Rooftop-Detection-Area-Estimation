@@ -54,7 +54,7 @@ class ProcessingResult:
     image_id: str
     image_path: str
     label_path: str
-    success: bool
+    success: bool = False
     output_path: Optional[str] = None
     error_message: Optional[str] = None
     processing_time: float = 0.0
@@ -109,7 +109,7 @@ def check_dependencies():
         logger.error("Install with: pip install numpy rasterio geopandas shapely Pillow matplotlib")
         sys.exit(1)
 
-    logger.info("All dependencies verified ✓")
+    logger.info("All dependencies verified")
 
 
 def load_image_metadata(image_path: Path) -> Dict[str, Any]:
@@ -399,7 +399,8 @@ def process_single_pair(
     result = ProcessingResult(
         image_id=base_id,
         image_path=str(image_path),
-        label_path=str(geojson_path)
+        label_path=str(geojson_path),
+        success=False
     )
 
     # Check for existing output

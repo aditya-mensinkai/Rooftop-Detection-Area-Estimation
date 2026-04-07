@@ -68,7 +68,7 @@ class ValidationResult:
     image_path: Path
     mask_path: Path
     image_id: str
-    is_valid: bool
+    is_valid: bool = False
     image_shape: Optional[Tuple[int, ...]] = None
     mask_shape: Optional[Tuple[int, ...]] = None
     mask_stats: Optional[MaskStats] = None
