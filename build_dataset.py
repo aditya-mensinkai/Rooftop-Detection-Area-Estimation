@@ -261,6 +261,12 @@ def copy_file_with_validation(src: Path, dst: Path, validate: bool = True) -> Tu
         Tuple of (success, error_message, file_size)
     """
     try:
+        # Check if source and destination are the same file
+        if src.resolve() == dst.resolve():
+            logger.warning(f"[SKIP] Source and destination are the same file: {src}")
+            file_size = src.stat().st_size
+            return True, None, file_size
+
         # Ensure destination directory exists
         dst.parent.mkdir(parents=True, exist_ok=True)
 
@@ -320,6 +326,25 @@ def copy_pair(image_src: Path, mask_src: Path, output_dirs: Dict[str, Path],
         skipped=False
     )
 
+    # Check if source and destination are the same for masks
+    if mask_src.resolve() == mask_dst.resolve():
+        logger.warning(f"[SKIP] Mask src/dst identical: {mask_src.name}")
+        # Mark as success since the file is already in place
+        result.success = True
+        result.skipped = True
+        result.image_size = image_src.stat().st_size if image_src.exists() else None
+        result.mask_size = mask_src.stat().st_size if mask_src.exists() else None
+        return result
+
+    # Check if source and destination are the same for images
+    if image_src.resolve() == image_dst.resolve():
+        logger.warning(f"[SKIP] Image src/dst identical: {image_src.name}")
+        result.success = True
+        result.skipped = True
+        result.image_size = image_src.stat().st_size if image_src.exists() else None
+        result.mask_size = mask_src.stat().st_size if mask_src.exists() else None
+        return result
+
     # Check if already exists
     if skip_existing and image_dst.exists() and mask_dst.exists():
         result.skipped = True
@@ -359,7 +384,7 @@ def copy_pair(image_src: Path, mask_src: Path, output_dirs: Dict[str, Path],
     result.image_size = img_size
 
     # Copy mask
-    mask_success, mask_error, mask_size = copy_file_with_validation(mask_src, mask_src)
+    mask_success, mask_error, mask_size = copy_file_with_validation(mask_src, mask_dst)
     if not mask_success:
         result.error_message = f"Mask copy failed: {mask_error}"
         # Clean up image if mask failed
@@ -595,14 +620,16 @@ def verify_dataset(dataset_path: Path) -> Dict:
 
     if images_without_masks:
         results['valid'] = False
+        missing_list = list(images_without_masks)[:5]
         results['errors'].append(
-            f"Images without masks: {len(images_without_masks)} - {list(images_without_masks)[:5]}"
+            f"[MISMATCH] {len(images_without_masks)} images without masks. First 5: {missing_list}"
         )
 
     if masks_without_images:
         results['valid'] = False
+        missing_list = list(masks_without_images)[:5]
         results['errors'].append(
-            f"Masks without images: {len(masks_without_images)} - {list(masks_without_images)[:5]}"
+            f"[MISMATCH] {len(masks_without_images)} masks without images. First 5: {missing_list}"
         )
 
     # Check for empty files
@@ -645,11 +672,11 @@ def verify_dataset(dataset_path: Path) -> Dict:
 
     # Final status
     if results['valid'] and not results['warnings']:
-        logger.info("✓ Dataset verification PASSED")
+        logger.info("[OK] Dataset verification PASSED")
     elif results['valid']:
-        logger.warning("✓ Dataset verification PASSED with warnings")
+        logger.warning("[OK] Dataset verification PASSED with warnings")
     else:
-        logger.error("✗ Dataset verification FAILED")
+        logger.error("[FAILED] Dataset verification FAILED")
 
     return results
 
@@ -705,14 +732,14 @@ def generate_summary_report(summary: DatasetSummary, output_dir: Path):
         logger.info(f"Saved skipped files list to {skipped_path}")
 
 
-def print_summary(summary: DatasetSummary):
+def print_summary(summary: DatasetSummary, output_dir: Path = None):
     """Print formatted summary to console."""
     print("\n" + "=" * 60)
     print("DATASET BUILD SUMMARY")
     print("=" * 60)
     print(f"Total pairs in JSON:    {summary.total_pairs}")
     print(f"Valid pairs found:      {summary.valid_pairs}")
-    print(f"Successfully copied:      {summary.copied_pairs}")
+    print(f"Successfully copied:    {summary.copied_pairs}")
     print(f"Skipped (exist):        {summary.skipped_pairs}")
     print(f"Failed:                 {summary.failed_pairs}")
     print(f"Missing masks:          {summary.missing_masks}")
@@ -720,6 +747,19 @@ def print_summary(summary: DatasetSummary):
     if summary.total_pairs > 0:
         success_rate = summary.copied_pairs / summary.total_pairs * 100
         print(f"Success rate:           {success_rate:.1f}%")
+
+    # Calculate final dataset size
+    if output_dir and output_dir.exists():
+        try:
+            images_dir = output_dir / 'images'
+            masks_dir = output_dir / 'masks'
+            image_dir_size = sum(f.stat().st_size for f in images_dir.iterdir() if f.is_file()) if images_dir.exists() else 0
+            mask_dir_size = sum(f.stat().st_size for f in masks_dir.iterdir() if f.is_file()) if masks_dir.exists() else 0
+            total_size_mb = (image_dir_size + mask_dir_size) / (1024 * 1024)
+            print(f"Total dataset size:     {total_size_mb:.2f} MB")
+        except Exception:
+            pass
+
     print("=" * 60 + "\n")
 
 
@@ -748,6 +788,9 @@ Examples:
 
     # Force re-copy (don't skip existing)
     python build_dataset.py --input_json matched_pairs.json --mask_src dataset/masks --no_skip
+
+    # Safe mode (skip if src==dst, verify only)
+    python build_dataset.py --input_json matched_pairs.json --mask_src dataset/masks --safe_mode
         """
     )
 
@@ -763,6 +806,8 @@ Examples:
                         help='Only verify existing dataset, skip building')
     parser.add_argument('--no_skip', action='store_true',
                         help='Do not skip existing files (force re-copy)')
+    parser.add_argument('--safe_mode', action='store_true',
+                        help='Safe mode: skip copying if src==dst, only verify and log')
     parser.add_argument('--verbose', action='store_true',
                         help='Enable verbose logging')
 
@@ -816,6 +861,29 @@ Examples:
         logger.error(f"Mask source directory not found: {args.mask_src}")
         sys.exit(1)
 
+    # Safe mode validation and source/destination collision check
+    output_mask_dir = args.output_dir / "masks"
+    output_image_dir = args.output_dir / "images"
+
+    if args.safe_mode:
+        logger.info("Running in SAFE MODE - will skip copying identical files")
+
+    if args.mask_src.resolve() == output_mask_dir.resolve():
+        logger.warning("=" * 60)
+        logger.warning("DETECTED: Mask source equals destination directory!")
+        logger.warning(f"Source: {args.mask_src}")
+        logger.warning(f"Destination: {output_mask_dir}")
+        logger.warning("Masks will be skipped (already in place)")
+        logger.warning("=" * 60)
+
+    if args.image_src and args.image_src.resolve() == output_image_dir.resolve():
+        logger.warning("=" * 60)
+        logger.warning("DETECTED: Image source equals destination directory!")
+        logger.warning(f"Source: {args.image_src}")
+        logger.warning(f"Destination: {output_image_dir}")
+        logger.warning("Images will be skipped (already in place)")
+        logger.warning("=" * 60)
+
     # Build dataset
     summary = build_dataset_structure(
         args.input_json,
@@ -829,7 +897,7 @@ Examples:
     generate_summary_report(summary, args.output_dir)
 
     # Print summary
-    print_summary(summary)
+    print_summary(summary, args.output_dir)
 
     # Verify the built dataset
     logger.info("Verifying built dataset...")
