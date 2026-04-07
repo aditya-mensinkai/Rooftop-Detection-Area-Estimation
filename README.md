@@ -18,6 +18,9 @@ A production-ready Python pipeline for converting SpaceNet satellite imagery and
 - [STEP 3: Batch Mask Generation](#step-3-batch-mask-generation)
 - [STEP 4: Visualize Masks (CRITICAL DEBUG)](#step-4-visualize-masks-critical-debug)
 - [STEP 5: Build Dataset Structure](#step-5-build-dataset-structure)
+- [STEP 6: Data Preprocessing Pipeline](#step-6-data-preprocessing-pipeline)
+- [STEP 7: PyTorch Dataset](#step-7-pytorch-dataset)
+- [STEP 8: Data Augmentation](#step-8-data-augmentation)
 - [Pipeline Architecture](#pipeline-architecture)
 - [Troubleshooting](#troubleshooting)
 - [Performance Tips](#performance-tips)
@@ -57,6 +60,7 @@ Solar_Sense/RoofTop_Detection/
 ├── generate_masks_batch.py       # STEP 3: Batch mask generator with multiprocessing
 ├── visualize_masks.py            # STEP 4: Visualize and validate masks (CRITICAL DEBUG)
 ├── build_dataset.py              # STEP 5: Build final dataset structure
+├── dataset.py                    # STEP 7-8: PyTorch Dataset + Data Augmentation
 ├── matched_pairs.json            # Generated: List of matched pairs
 ├── missing_labels.txt            # Generated: Images without labels
 ├── missing_images.txt            # Generated: Labels without images
@@ -1107,6 +1111,496 @@ python3 build_dataset.py --input_json matched_pairs.json --mask_src dataset/mask
 
 ---
 
+## STEP 6: Data Preprocessing Pipeline
+
+### Script: `dataset.py`
+
+**FINAL STEP**: PyTorch Dataset implementation that prepares image-mask pairs for training with U-Net or other segmentation models.
+
+### Why This Step Matters
+
+| Problem | Impact |
+|---------|--------|
+| Wrong preprocessing | Model receives incorrect input format |
+| Shape mismatch | Training crashes with dimension errors |
+| No augmentation | Model overfits, poor generalization |
+| Wrong interpolation on masks | Mask edges become blurry, labels corrupted |
+| Wrong normalization | Model can't learn effectively |
+
+### What This Script Does
+
+1. **Lazy Loading**: Images loaded on-demand (not all in memory)
+2. **Flexible Loading**: Supports .tif via rasterio, .png/.jpg via PIL
+3. **Preprocessing**: Resize → Normalize → Channel reorder
+4. **Augmentation**: Optional flips, rotation, brightness
+5. **Validation**: Checks alignment, warns on anomalies
+
+### Key Features
+
+| Feature | Description |
+|---------|-------------|
+| **Lazy Loading** | Images loaded in `__getitem__`, not in `__init__` |
+| **Preprocessing** | Automatic resize, normalize, HWC→CHW conversion |
+| **Data Augmentation** | Flip, rotate, brightness (same for image+mask) |
+| **Validation** | Checks shape alignment, empty/full masks |
+| **Format Output** | Returns tensors: image [3,H,W], mask [1,H,W] |
+
+### Preprocessing Pipeline
+
+```
+Image:                          Mask:
+┌─────────────┐                ┌─────────────┐
+│ Load .tif   │                │ Load .npy   │
+│ or .png     │                │ or .png     │
+└──────┬──────┘                └──────┬──────┘
+       │                             │
+       ▼                             ▼
+┌─────────────┐                ┌─────────────┐
+│ Resize      │                │ Resize      │
+│ INTER_LINEAR│                │ INTER_NEAREST│
+│ (256,256)   │                │ (256,256)   │
+└──────┬──────┘                └──────┬──────┘
+       │                             │
+       ▼                             ▼
+┌─────────────┐                ┌─────────────┐
+│ Normalize   │                │ Ensure      │
+│ / 255.0     │                │ binary {0,1}│
+└──────┬──────┘                └──────┬──────┘
+       │                             │
+       ▼                             ▼
+┌─────────────┐                ┌─────────────┐
+│ HWC → CHW   │                │ Add channel │
+│             │                │ [1,H,W]     │
+└──────┬──────┘                └──────┬──────┘
+       │                             │
+       ▼                             ▼
+┌─────────────┐                ┌─────────────┐
+│ Image Tensor│                │ Mask Tensor │
+│ [3,256,256] │                │ [1,256,256]│
+│ float32     │                │ float32     │
+└─────────────┘                └─────────────┘
+```
+
+### Usage
+
+#### Basic Dataset
+
+```python
+from dataset import RoofDataset, get_dataloader
+
+# Create dataset
+dataset = RoofDataset(
+    image_dir='dataset/images',
+    mask_dir='dataset/masks',
+    target_size=256
+)
+
+# Create DataLoader
+train_loader = get_dataloader(
+    dataset,
+    batch_size=8,
+    shuffle=True,
+    num_workers=2
+)
+
+# Training loop
+for images, masks in train_loader:
+    # images: [B, 3, 256, 256]
+    # masks: [B, 1, 256, 256]
+    pass
+```
+
+#### With Augmentation
+
+```python
+# Enable augmentation
+dataset = RoofDataset(
+    image_dir='dataset/images',
+    mask_dir='dataset/masks',
+    target_size=256,
+    augment=True  # Enable random flips, rotation, brightness
+)
+```
+
+#### Test and Visualize
+
+```bash
+# Basic test
+python3 dataset.py --image_dir dataset/images --mask_dir dataset/masks --visualize
+
+# With augmentation
+python3 dataset.py --image_dir dataset/images --mask_dir dataset/masks --augment --visualize
+
+# Test DataLoader
+python3 dataset.py --image_dir dataset/images --mask_dir dataset/masks --batch_size 8 --num_workers 2
+```
+
+### Command-Line Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--image_dir` | (required) | Directory containing images |
+| `--mask_dir` | (required) | Directory containing masks |
+| `--target_size` | `256` | Target size for resizing |
+| `--augment` | `False` | Enable data augmentation |
+| `--batch_size` | `4` | Batch size for DataLoader test |
+| `--visualize` | `False` | Visualize samples |
+| `--save_path` | `None` | Path to save visualization |
+| `--num_workers` | `0` | DataLoader workers (0=main process) |
+
+### RoofDataset Class
+
+#### Constructor
+
+```python
+dataset = RoofDataset(
+    image_dir='dataset/images',     # Path to images
+    mask_dir='dataset/masks',       # Path to masks
+    target_size=256,                 # Resize to (256, 256)
+    augment=False,                   # Enable augmentation
+    transform=None,                  # Optional custom transforms
+    validate=True                    # Validate dataset on init
+)
+```
+
+#### Output Format
+
+| Property | Image | Mask |
+|----------|-------|------|
+| Shape | `[3, 256, 256]` | `[1, 256, 256]` |
+| Type | `float32` | `float32` |
+| Range | `[0, 1]` | `{0, 1}` |
+| Channels | RGB | Binary |
+
+### Data Augmentation
+
+Augmentations applied **with same random parameters** to both image and mask:
+
+| Augmentation | Probability | Details |
+|--------------|-------------|---------|
+| Horizontal Flip | 0.5 | Random horizontal flip |
+| Vertical Flip | 0.5 | Random vertical flip |
+| Rotation | 0.5 | 90°, 180°, or 270° |
+| Brightness | 0.5 | Factor 0.8-1.2 (image only) |
+
+```python
+from dataset import Augmentation
+
+# Custom augmentation
+aug = Augmentation(
+    horizontal_flip=True,
+    vertical_flip=True,
+    rotation=True,
+    brightness=True,
+    p=0.5  # Probability for each
+)
+
+image_aug, mask_aug = aug(image, mask)
+```
+
+### Validation Checks
+
+Automatic checks performed:
+
+| Check | Action | Error Level |
+|-------|--------|-------------|
+| File exists | Skip missing files | Warning |
+| Shape alignment | Ensure image and mask same size | Error |
+| Empty mask | Warn if mask has no buildings | Warning |
+| Full mask | Warn if mask is all buildings | Warning |
+| Sample validation | Test first sample on init | Error |
+
+### Example Output
+
+```
+2024-01-15 10:30:45 - INFO - Initialized dataset with 3845 samples
+2024-01-15 10:30:45 - INFO - Testing single sample...
+2024-01-15 10:30:45 - INFO - Image shape: (3, 256, 256), dtype: float32
+2024-01-15 10:30:45 - INFO - Mask shape: (1, 256, 256), dtype: float32
+2024-01-15 10:30:45 - INFO - Image range: [0.000, 1.000]
+2024-01-15 10:30:45 - INFO - Mask unique values: [0. 1.]
+2024-01-15 10:30:45 - INFO - Dataset validation passed
+```
+
+### Python API Functions
+
+```python
+from dataset import (
+    load_image,
+    load_mask,
+    preprocess_image,
+    preprocess_mask,
+    visualize_batch,
+    visualize_augmentations
+)
+
+# Load single files
+image = load_image('dataset/images/img1.tif')  # [H, W, 3]
+mask = load_mask('dataset/masks/img1.npy')     # [H, W]
+
+# Preprocess individually
+image_tensor = preprocess_image(image, target_size=256)  # [3, H, W]
+mask_tensor = preprocess_mask(mask, target_size=256)     # [1, H, W]
+
+# Visualize batch
+visualize_batch(dataset, num_samples=4, save_path='viz.png')
+
+# Visualize augmentations
+visualize_augmentations(dataset, idx=0, num_variants=4)
+```
+
+### Common Issues
+
+#### Issue: `ImportError: No module named 'torch'`
+
+**Cause**: PyTorch not installed.
+
+**Solution**:
+```bash
+# Install PyTorch (CPU version)
+pip install torch torchvision
+
+# Or with CUDA (if GPU available)
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+```
+
+#### Issue: `Shape mismatch: image=(650, 650, 3), mask=(256, 256)`
+
+**Cause**: Images and masks not resized consistently.
+
+**Solution**: Images should already be resized to match masks, or regenerate masks:
+```bash
+python3 generate_masks_batch.py --resize 256 --num_workers 4
+```
+
+#### Issue: `Dataset validation failed: Image should have 3 channels, got 1`
+
+**Cause**: Grayscale images loaded instead of RGB.
+
+**Solution**: Check source images are RGB, or the loading code stacks channels.
+
+#### Issue: `Mask unique values: [0.]` (all zeros)
+
+**Cause**: Masks weren't generated correctly or are empty.
+
+**Solution**:
+```bash
+# Check mask
+python3 -c "import numpy as np; print(np.load('dataset/masks/img1.npy').sum())"
+
+# Regenerate if needed
+python3 generate_masks.py --limit 1 --visualize
+```
+
+#### Issue: `RuntimeError: DataLoader worker (pid xxx) is killed by signal: Killed`
+
+**Cause**: Out of memory with multiple workers.
+
+**Solution**: Reduce num_workers:
+```python
+train_loader = get_dataloader(dataset, batch_size=8, num_workers=0)  # Single process
+```
+
+---
+
+## STEP 7: PyTorch Dataset
+
+### Script: `dataset.py`
+
+PyTorch Dataset implementation that loads and prepares image-mask pairs for training segmentation models.
+
+### What This Step Does
+
+1. **Image Loading**: Supports .tif (via rasterio) and standard formats (via PIL/cv2)
+2. **Mask Loading**: Loads .npy or .png masks
+3. **Preprocessing**: Resize, normalize, format conversion
+4. **Validation**: Checks alignment, warns on anomalies
+5. **Output**: Returns PyTorch tensors ready for training
+
+### Input/Output Format
+
+| | Shape | Dtype | Range |
+|---|---|---|---|
+| **Image Input** | (H, W, 3) | uint8 | [0, 255] |
+| **Image Output** | [3, 256, 256] | float32 | [0, 1] |
+| **Mask Input** | (H, W) | uint8/float | {0, 1} |
+| **Mask Output** | [1, 256, 256] | float32 | {0, 1} |
+
+### Usage
+
+```python
+from dataset import RoofDataset, get_dataloader
+
+# Create dataset
+dataset = RoofDataset(
+    image_dir='dataset/images',
+    mask_dir='dataset/masks',
+    target_size=256
+)
+
+# Create DataLoader
+train_loader = get_dataloader(
+    dataset,
+    batch_size=8,
+    shuffle=True,
+    num_workers=2,
+    pin_memory=True
+)
+
+# Training loop
+for images, masks in train_loader:
+    # images: [B, 3, 256, 256]
+    # masks: [B, 1, 256, 256]
+    pass
+```
+
+### Key Features
+
+| Feature | Description |
+|---------|-------------|
+| **Lazy Loading** | Images loaded on-demand in `__getitem__` |
+| **Auto-matching** | Pairs images/masks by filename (img1.tif ↔ img1.npy) |
+| **Format Support** | .tif, .png, .jpg images; .npy, .png masks |
+| **Preprocessing** | Resize, normalize, HWC→CHW conversion |
+| **Validation** | Shape checks, empty/full mask warnings |
+
+### RoofDataset Class
+
+```python
+dataset = RoofDataset(
+    image_dir='dataset/images',     # Path to images
+    mask_dir='dataset/masks',       # Path to masks
+    target_size=256,                 # Resize to (256, 256)
+    augment=True,                    # Enable augmentation (STEP 8)
+    validate=True                    # Validate on init
+)
+```
+
+### Data Loading Pipeline
+
+```
+Image:                          Mask:
+┌─────────────┐                ┌─────────────┐
+│ Load .tif   │                │ Load .npy   │
+│ or .png     │                │ or .png     │
+└──────┬──────┘                └──────┬──────┘
+       │                             │
+       ▼                             ▼
+┌─────────────┐                ┌─────────────┐
+│ Resize      │                │ Resize      │
+│ INTER_LINEAR│                │ INTER_NEAREST│
+│ (256,256)   │                │ (256,256)   │
+└──────┬──────┘                └──────┬──────┘
+       │                             │
+       ▼                             ▼
+┌─────────────┐                ┌─────────────┐
+│ Normalize   │                │ Ensure      │
+│ / 255.0     │                │ binary {0,1}│
+└──────┬──────┘                └──────┬──────┘
+       │                             │
+       ▼                             ▼
+┌─────────────┐                ┌─────────────┐
+│ HWC → CHW   │                │ Add channel │
+│ [3,H,W]     │                │ [1,H,W]     │
+└──────┬──────┘                └──────┬──────┘
+       │                             │
+       ▼                             ▼
+┌─────────────┐                ┌─────────────┐
+│   Tensor    │                │   Tensor    │
+│ [3,256,256] │                │ [1,256,256] │
+└─────────────┘                └─────────────┘
+```
+
+### Validation Checks
+
+| Check | Action | Level |
+|-------|--------|-------|
+| File exists | Skip missing files | Warning |
+| Shape alignment | Ensure image and mask same size | Error |
+| Empty mask | Warn if mask has no buildings | Warning |
+| Full mask | Warn if mask is all buildings | Warning |
+
+### Command-Line Test
+
+```bash
+# Basic test
+python3 dataset.py --image_dir dataset/images --mask_dir dataset/masks --visualize
+
+# Test DataLoader
+python3 dataset.py --image_dir dataset/images --mask_dir dataset/masks --batch_size 8 --num_workers 2
+```
+
+---
+
+## STEP 8: Data Augmentation
+
+### Overview
+
+Data augmentation applies random transformations to increase training data diversity and prevent overfitting. **Critical**: Same transformation must be applied to both image and mask.
+
+### Implemented Augmentations
+
+| Augmentation | Probability | Details |
+|--------------|-------------|---------|
+| **Horizontal Flip** | 0.5 | Random horizontal mirror |
+| **Vertical Flip** | 0.5 | Random vertical mirror |
+| **Rotation** | 0.5 | 90°, 180°, or 270° |
+| **Brightness** | 0.5 | Factor 0.8-1.2 (image only) |
+
+### Critical Requirements
+
+⚠️ **IMPORTANT**: For segmentation, augmentations must:
+
+1. **Same transform for image & mask**: If image is flipped, mask must flip identically
+2. **Nearest neighbor for masks**: Prevents interpolation artifacts at label boundaries
+3. **No interpolation on labels**: Mask values must stay exactly {0, 1}
+
+### Augmentation Class
+
+```python
+from dataset import Augmentation
+
+# Custom augmentation
+aug = Augmentation(
+    horizontal_flip=True,
+    vertical_flip=True,
+    rotation=True,
+    brightness=True,
+    p=0.5  # Probability for each
+)
+
+image_aug, mask_aug = aug(image, mask)
+```
+
+### Usage with Dataset
+
+```python
+# Enable augmentation
+dataset = RoofDataset(
+    image_dir='dataset/images',
+    mask_dir='dataset/masks',
+    target_size=256,
+    augment=True  # Enable random flips, rotation, brightness
+)
+```
+
+### Test Augmentation
+
+```bash
+# Visualize augmentations
+python3 dataset.py --image_dir dataset/images --mask_dir dataset/masks --augment --visualize
+```
+
+### Visualization Output
+
+Shows side-by-side comparison:
+- Original image
+- Original mask
+- Augmented image  
+- Augmented mask
+
+---
+
 ## Pipeline Architecture
 
 ```
@@ -1166,6 +1660,18 @@ python3 build_dataset.py --input_json matched_pairs.json --mask_src dataset/mask
                                  │
                                  ▼
                         ┌─────────────────┐
+                        │    dataset      │
+                        │       .py       │
+                        │ (STEP 7-8)      │
+                        ├─────────────────┤
+                        │  1. Load        │
+                        │  2. Preprocess  │
+                        │  3. Augment     │
+                        │  4. Tensor      │
+                        └─────────────────┘
+                                 │
+                                 ▼
+                        ┌─────────────────┐
                         │   ML Training   │
                         ├─────────────────┤
                         │                 │
@@ -1187,6 +1693,7 @@ python3 build_dataset.py --input_json matched_pairs.json --mask_src dataset/mask
 | **3** | `generate_masks_batch.py` | `matched_pairs.json` | `dataset/masks/` | Production batch processing |
 | **4** | `visualize_masks.py` | `dataset/masks/` | Validation report | Verify alignment before training |
 | **5** | `build_dataset.py` | `matched_pairs.json` + masks | `dataset/` | Build clean training structure |
+| **6** | `dataset.py` | `dataset/images/` + `dataset/masks/` | PyTorch DataLoader | Preprocessing + Augmentation for model training |
 
 ---
 
