@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+ENV/
+
+# OS
+.DS_Store
+
+# Data and Logs
+SN2_Vegas/
+mask_generation.log
+matched_pairs.json
+missing_images.txt
+*.log
+
+# Project specific
+.claude/
