@@ -18,8 +18,8 @@ A production-ready Python pipeline for converting SpaceNet satellite imagery and
 - [STEP 3: Batch Mask Generation](#step-3-batch-mask-generation)
 - [STEP 4: Visualize Masks (CRITICAL DEBUG)](#step-4-visualize-masks-critical-debug)
 - [STEP 5: Build Dataset Structure](#step-5-build-dataset-structure)
-- [STEP 6: Data Preprocessing Pipeline](#step-6-data-preprocessing-pipeline)
-- [STEP 7: PyTorch Dataset](#step-7-pytorch-dataset)
+- [STEP 6: Production-Ready PyTorch Dataset](#step-6-production-ready-pytorch-dataset)
+- [STEP 7: PyTorch Dataset Details](#step-7-pytorch-dataset-production)
 - [STEP 8: Data Augmentation](#step-8-data-augmentation)
 - [Pipeline Architecture](#pipeline-architecture)
 - [Troubleshooting](#troubleshooting)
@@ -65,7 +65,7 @@ Solar_Sense/RoofTop_Detection/
 ├── missing_labels.txt            # Generated: Images without labels
 ├── missing_images.txt            # Generated: Labels without images
 ├── invalid_files.txt             # Generated: Corrupted/invalid files
-├── dataset/
+├── dataset/                      # Intermediate output (STEP 2-4)
 │   └── masks/                    # Generated: Binary mask files
 │       ├── img1.npy
 │       ├── img2.npy
@@ -73,6 +73,13 @@ Solar_Sense/RoofTop_Detection/
 ├── dataset/visualizations/       # Generated: Debug visualizations
 │   ├── img1_viz.png
 │   └── ...
+├── dataset_final/                # ✅ FINAL dataset for training (STEP 5+)
+│   ├── images/                   # Training images (.tif)
+│   │   ├── img1.tif
+│   │   └── ...
+│   └── masks/                    # Training masks (.npy)
+│       ├── img1.npy
+│       └── ...
 └── SN2_Vegas/                    # SpaceNet Dataset
     ├── PS-RGB/                   # Satellite images (.tif)
     │   ├── SN2_buildings_train_AOI_2_Vegas_PS-RGB_img1.tif
@@ -1111,39 +1118,49 @@ python3 build_dataset.py --input_json matched_pairs.json --mask_src dataset/mask
 
 ---
 
-## STEP 6: Data Preprocessing Pipeline
+## STEP 6: Production-Ready PyTorch Dataset
 
 ### Script: `dataset.py`
 
-**FINAL STEP**: PyTorch Dataset implementation that prepares image-mask pairs for training with U-Net or other segmentation models.
+**Production-Ready PyTorch Dataset** for rooftop segmentation with strict filename matching, comprehensive validation, and clean logging.
 
 ### Why This Step Matters
 
-| Problem | Impact |
-|---------|--------|
-| Wrong preprocessing | Model receives incorrect input format |
-| Shape mismatch | Training crashes with dimension errors |
-| No augmentation | Model overfits, poor generalization |
-| Wrong interpolation on masks | Mask edges become blurry, labels corrupted |
-| Wrong normalization | Model can't learn effectively |
-
-### What This Script Does
-
-1. **Lazy Loading**: Images loaded on-demand (not all in memory)
-2. **Flexible Loading**: Supports .tif via rasterio, .png/.jpg via PIL
-3. **Preprocessing**: Resize → Normalize → Channel reorder
-4. **Augmentation**: Optional flips, rotation, brightness
-5. **Validation**: Checks alignment, warns on anomalies
+| Problem | Impact | Solution |
+|---------|--------|----------|
+| Wrong directory | Loads 3 samples instead of 3850 | Auto-detection suggests `dataset_final` |
+| Partial loading | Training on incomplete data | Strict filename intersection matching |
+| Confusing logs | Hard to debug issues | Clean `[INFO]`/`[WARNING]`/`[ERROR]` format |
+| Empty masks silently passed | Model learns wrong patterns | Explicit warning for empty masks |
+| Shape mismatches | Runtime crashes | Validation on initialization |
 
 ### Key Features
 
 | Feature | Description |
 |---------|-------------|
-| **Lazy Loading** | Images loaded in `__getitem__`, not in `__init__` |
-| **Preprocessing** | Automatic resize, normalize, HWC→CHW conversion |
-| **Data Augmentation** | Flip, rotate, brightness (same for image+mask) |
-| **Validation** | Checks shape alignment, empty/full masks |
-| **Format Output** | Returns tensors: image [3,H,W], mask [1,H,W] |
+| **Strict Matching** | Only pairs where `img123.tif` AND `img123.npy` both exist |
+| **Auto-Detection** | Suggests `dataset_final` if `dataset` has < 100 samples |
+| **Clean Logging** | Consistent `[INFO]`/`[WARNING]`/`[ERROR]` prefixes |
+| **Dataset Summary** | Reports total images, masks, and valid pairs on init |
+| **Empty Mask Handling** | Warns but keeps empty masks for training |
+| **3-Panel Viz** | Shows image, mask, and overlay with coverage stats |
+
+### File Matching Strategy
+
+```
+Image Directory          Mask Directory          Valid Pairs (Intersection)
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│ img001.tif      │     │ img001.npy      │     │ img001.tif ↔    │
+│ img002.tif      │     │ img002.npy      │     │ img001.npy      │
+│ img003.tif      │     │ img004.npy      │     │ img002.tif ↔    │
+│ img005.tif      │     │ img005.npy      │     │ img002.npy      │
+└─────────────────┘     └─────────────────┘     │ img005.tif ↔    │
+                                                  │ img005.npy      │
+                                                  └─────────────────┘
+
+[WARNING] 1 images without masks: ['img003']
+[WARNING] 1 masks without images: ['img004']
+```
 
 ### Preprocessing Pipeline
 
@@ -1151,7 +1168,7 @@ python3 build_dataset.py --input_json matched_pairs.json --mask_src dataset/mask
 Image:                          Mask:
 ┌─────────────┐                ┌─────────────┐
 │ Load .tif   │                │ Load .npy   │
-│ or .png     │                │ or .png     │
+│ (rasterio)  │                │ (numpy)     │
 └──────┬──────┘                └──────┬──────┘
        │                             │
        ▼                             ▼
@@ -1170,13 +1187,13 @@ Image:                          Mask:
        ▼                             ▼
 ┌─────────────┐                ┌─────────────┐
 │ HWC → CHW   │                │ Add channel │
-│             │                │ [1,H,W]     │
+│ [3,H,W]     │                │ [1,H,W]     │
 └──────┬──────┘                └──────┬──────┘
        │                             │
        ▼                             ▼
 ┌─────────────┐                ┌─────────────┐
 │ Image Tensor│                │ Mask Tensor │
-│ [3,256,256] │                │ [1,256,256]│
+│ [3,256,256] │                │ [1,256,256] │
 │ float32     │                │ float32     │
 └─────────────┘                └─────────────┘
 ```
@@ -1188,10 +1205,11 @@ Image:                          Mask:
 ```python
 from dataset import RoofDataset, get_dataloader
 
-# Create dataset
+# Create dataset with STRICT matching
+# Only pairs where both .tif and .npy exist are included
 dataset = RoofDataset(
-    image_dir='dataset/images',
-    mask_dir='dataset/masks',
+    image_dir='dataset_final/images',  # Use dataset_final, not dataset
+    mask_dir='dataset_final/masks',
     target_size=256
 )
 
@@ -1213,40 +1231,99 @@ for images, masks in train_loader:
 #### With Augmentation
 
 ```python
-# Enable augmentation
+# Enable augmentation (same transforms for image + mask)
 dataset = RoofDataset(
-    image_dir='dataset/images',
-    mask_dir='dataset/masks',
+    image_dir='dataset_final/images',
+    mask_dir='dataset_final/masks',
     target_size=256,
-    augment=True  # Enable random flips, rotation, brightness
+    augment=True  # Horizontal/vertical flip, rotation, brightness
 )
 ```
 
 #### Test and Visualize
 
 ```bash
-# Basic test
-python3 dataset.py --image_dir dataset/images --mask_dir dataset/masks --visualize
+# Basic test (correct directory)
+python3 dataset.py --image_dir dataset_final/images --mask_dir dataset_final/masks
 
-# With augmentation
-python3 dataset.py --image_dir dataset/images --mask_dir dataset/masks --augment --visualize
+# With 3-panel visualization
+python3 dataset.py --image_dir dataset_final/images --mask_dir dataset_final/masks --visualize
+
+# With augmentation test
+python3 dataset.py --image_dir dataset_final/images --mask_dir dataset_final/masks --augment --visualize
 
 # Test DataLoader
-python3 dataset.py --image_dir dataset/images --mask_dir dataset/masks --batch_size 8 --num_workers 2
+python3 dataset.py --image_dir dataset_final/images --mask_dir dataset_final/masks --batch_size 8 --num_workers 2
 ```
 
 ### Command-Line Arguments
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--image_dir` | (required) | Directory containing images |
-| `--mask_dir` | (required) | Directory containing masks |
+| `--image_dir` | (required) | Directory containing .tif images |
+| `--mask_dir` | (required) | Directory containing .npy masks |
 | `--target_size` | `256` | Target size for resizing |
 | `--augment` | `False` | Enable data augmentation |
 | `--batch_size` | `4` | Batch size for DataLoader test |
-| `--visualize` | `False` | Visualize samples |
-| `--save_path` | `None` | Path to save visualization |
+| `--visualize` | `False` | Show 3-panel visualization |
+| `--save_path` | `None` | Save visualization to path |
 | `--num_workers` | `0` | DataLoader workers (0=main process) |
+| `--test_idx` | `0` | Sample index to test |
+
+### Expected Output
+
+#### Correct Directory (dataset_final)
+
+```
+======================================================================
+ROOFTOP SEGMENTATION DATASET - PRODUCTION PIPELINE
+======================================================================
+
+[INFO] Test 1: Dataset Initialization
+----------------------------------------------------------------------
+[INFO] Total images: 3850
+[INFO] Total masks: 3850
+[INFO] Valid pairs: 3850
+[INFO] Image directory: dataset_final/images
+[INFO] Mask directory: dataset_final/masks
+[INFO] Target size: 256
+[INFO] Augmentation: disabled
+[INFO] Dataset initialized successfully
+[INFO] Dataset validation passed
+
+[INFO] Test 2: Single Sample Loading
+----------------------------------------------------------------------
+[INFO] Sample 0:
+[INFO]   Image shape: (3, 256, 256), dtype: float32
+[INFO]   Mask shape: (1, 256, 256), dtype: float32
+[INFO]   Image range: [0.000, 1.000]
+[INFO]   Mask coverage: 23.5%
+[INFO] ✓ Single sample loading passed
+
+[INFO] Test 4: DataLoader Test
+----------------------------------------------------------------------
+[INFO] Batch 1:
+[INFO]   Images shape: torch.Size([4, 3, 256, 256])
+[INFO]   Masks shape: torch.Size([4, 1, 256, 256])
+[INFO]   Coverage: 21.3%
+...
+======================================================================
+ALL TESTS PASSED
+======================================================================
+[INFO] Dataset ready for training with 3850 samples
+======================================================================
+```
+
+#### Wrong Directory (dataset)
+
+```
+[ERROR] Dataset too small! Only 3 valid pairs found.
+[ERROR] Expected: thousands of samples for training.
+[INFO] Found alternative: dataset_final
+[INFO] Try: --image_dir dataset_final/images --mask_dir dataset_final/masks
+[WARNING] 3847 images without masks
+[ERROR] Dataset too small (3 samples) — check directory paths
+```
 
 ### RoofDataset Class
 
@@ -1403,39 +1480,44 @@ train_loader = get_dataloader(dataset, batch_size=8, num_workers=0)  # Single pr
 
 ---
 
-## STEP 7: PyTorch Dataset
+## STEP 7: PyTorch Dataset (Production)
+
+> **Note**: This is a detailed reference. See [STEP 6](#step-6-production-ready-pytorch-dataset) for the main usage guide.
 
 ### Script: `dataset.py`
 
-PyTorch Dataset implementation that loads and prepares image-mask pairs for training segmentation models.
+Production-ready PyTorch Dataset with **strict filename matching** and **comprehensive validation**.
 
 ### What This Step Does
 
-1. **Image Loading**: Supports .tif (via rasterio) and standard formats (via PIL/cv2)
-2. **Mask Loading**: Loads .npy or .png masks
-3. **Preprocessing**: Resize, normalize, format conversion
-4. **Validation**: Checks alignment, warns on anomalies
-5. **Output**: Returns PyTorch tensors ready for training
+1. **Strict File Matching**: Only includes pairs where BOTH image.tif AND mask.npy exist
+2. **Dataset Validation**: Raises error if < 100 samples, suggests correct directory
+3. **Image Loading**: .tif via rasterio (SpaceNet format)
+4. **Mask Loading**: .npy masks (binary numpy arrays)
+5. **Preprocessing**: Resize, normalize, format conversion
+6. **Clean Logging**: [INFO]/[WARNING]/[ERROR] prefixes for clarity
 
 ### Input/Output Format
 
-| | Shape | Dtype | Range |
-|---|---|---|---|
-| **Image Input** | (H, W, 3) | uint8 | [0, 255] |
-| **Image Output** | [3, 256, 256] | float32 | [0, 1] |
-| **Mask Input** | (H, W) | uint8/float | {0, 1} |
-| **Mask Output** | [1, 256, 256] | float32 | {0, 1} |
+| | Shape | Dtype | Range | Format |
+|---|---|---|---|---|
+| **Image Input** | (H, W, 3) | uint8 | [0, 255] | .tif (SpaceNet) |
+| **Image Output** | [3, 256, 256] | float32 | [0, 1] | CHW tensor |
+| **Mask Input** | (H, W) | float32 | {0, 1} | .npy |
+| **Mask Output** | [1, 256, 256] | float32 | {0, 1} | CHW tensor |
 
 ### Usage
 
 ```python
 from dataset import RoofDataset, get_dataloader
 
-# Create dataset
+# Create dataset - USE dataset_final, not dataset!
 dataset = RoofDataset(
-    image_dir='dataset/images',
-    mask_dir='dataset/masks',
-    target_size=256
+    image_dir='dataset_final/images',  # Correct directory
+    mask_dir='dataset_final/masks',
+    target_size=256,
+    augment=False,                     # Enable for training
+    validate=True                      # Validates on init
 )
 
 # Create DataLoader
@@ -1449,8 +1531,8 @@ train_loader = get_dataloader(
 
 # Training loop
 for images, masks in train_loader:
-    # images: [B, 3, 256, 256]
-    # masks: [B, 1, 256, 256]
+    # images: [B, 3, 256, 256], values in [0, 1]
+    # masks: [B, 1, 256, 256], values in {0, 1}
     pass
 ```
 
@@ -1458,76 +1540,125 @@ for images, masks in train_loader:
 
 | Feature | Description |
 |---------|-------------|
-| **Lazy Loading** | Images loaded on-demand in `__getitem__` |
-| **Auto-matching** | Pairs images/masks by filename (img1.tif ↔ img1.npy) |
-| **Format Support** | .tif, .png, .jpg images; .npy, .png masks |
-| **Preprocessing** | Resize, normalize, HWC→CHW conversion |
-| **Validation** | Shape checks, empty/full mask warnings |
+| **Strict Matching** | Intersection of image and mask filenames only |
+| **Dataset Summary** | Reports total images, masks, valid pairs on init |
+| **Auto-Detection** | Suggests `dataset_final` if dataset too small |
+| **Clean Logging** | Consistent `[INFO]`/`[WARNING]`/`[ERROR]` format |
+| **Empty Mask Warning** | Warns but keeps empty masks for training |
+| **3-Panel Visualization** | Image, mask, and red overlay with coverage % |
 
 ### RoofDataset Class
 
 ```python
+from pathlib import Path
+from dataset import RoofDataset
+
 dataset = RoofDataset(
-    image_dir='dataset/images',     # Path to images
-    mask_dir='dataset/masks',       # Path to masks
-    target_size=256,                 # Resize to (256, 256)
-    augment=True,                    # Enable augmentation (STEP 8)
-    validate=True                    # Validate on init
+    image_dir='dataset_final/images',  # Path to .tif images
+    mask_dir='dataset_final/masks',     # Path to .npy masks
+    target_size=256,                    # Resize to (256, 256)
+    augment=False,                      # Enable augmentation (see STEP 8)
+    transform=None,                     # Optional custom transforms
+    validate=True                       # Validate dataset on init
 )
+
+# Access dataset info
+print(f"Total pairs: {len(dataset)}")
+print(f"Image 0: {dataset.pairs[0][0].name}")  # image filename
+print(f"Mask 0: {dataset.pairs[0][1].name}")   # mask filename
+
+# Get sample
+image, mask = dataset[0]  # image: [3,256,256], mask: [1,256,256]
 ```
 
-### Data Loading Pipeline
+### Strict Filename Matching
 
-```
-Image:                          Mask:
-┌─────────────┐                ┌─────────────┐
-│ Load .tif   │                │ Load .npy   │
-│ or .png     │                │ or .png     │
-└──────┬──────┘                └──────┬──────┘
-       │                             │
-       ▼                             ▼
-┌─────────────┐                ┌─────────────┐
-│ Resize      │                │ Resize      │
-│ INTER_LINEAR│                │ INTER_NEAREST│
-│ (256,256)   │                │ (256,256)   │
-└──────┬──────┘                └──────┬──────┘
-       │                             │
-       ▼                             ▼
-┌─────────────┐                ┌─────────────┐
-│ Normalize   │                │ Ensure      │
-│ / 255.0     │                │ binary {0,1}│
-└──────┬──────┘                └──────┬──────┘
-       │                             │
-       ▼                             ▼
-┌─────────────┐                ┌─────────────┐
-│ HWC → CHW   │                │ Add channel │
-│ [3,H,W]     │                │ [1,H,W]     │
-└──────┬──────┘                └──────┬──────┘
-       │                             │
-       ▼                             ▼
-┌─────────────┐                ┌─────────────┐
-│   Tensor    │                │   Tensor    │
-│ [3,256,256] │                │ [1,256,256] │
-└─────────────┘                └─────────────┘
+The dataset uses **intersection matching** to ensure only valid pairs are included:
+
+```python
+# Get all image stems (filenames without extension)
+image_files = {f.stem: f for f in image_dir.glob('*.tif')}
+# Result: {'img001': Path('img001.tif'), 'img002': Path('img002.tif'), ...}
+
+# Get all mask stems
+mask_files = {f.stem: f for f in mask_dir.glob('*.npy')}
+# Result: {'img001': Path('img001.npy'), 'img002': Path('img002.npy'), ...}
+
+# Find intersection (only pairs where BOTH exist)
+valid_stems = set(image_files.keys()) & set(mask_files.keys())
+# Result: {'img001', 'img002', ...}
+
+# Build sorted pairs
+pairs = [(image_files[stem], mask_files[stem]) for stem in sorted(valid_stems)]
 ```
 
-### Validation Checks
+### Dataset Validation Checks
 
-| Check | Action | Level |
-|-------|--------|-------|
-| File exists | Skip missing files | Warning |
-| Shape alignment | Ensure image and mask same size | Error |
-| Empty mask | Warn if mask has no buildings | Warning |
-| Full mask | Warn if mask is all buildings | Warning |
+| Check | Condition | Action |
+|-------|-----------|--------|
+| Dataset size | `len(pairs) < 100` | Raise error, suggest `dataset_final` |
+| Unmatched images | Images without masks | Log `[WARNING]` with count |
+| Unmatched masks | Masks without images | Log `[WARNING]` with count |
+| Empty mask | `mask.sum() == 0` | Log `[WARNING]` but keep for training |
+| Shape mismatch | Image size != mask size | Raise error |
+
+### Output Examples
+
+#### Successful Initialization
+
+```
+[INFO] Total images: 3850
+[INFO] Total masks: 3850
+[INFO] Valid pairs: 3850
+[INFO] Image directory: dataset_final/images
+[INFO] Mask directory: dataset_final/masks
+[INFO] Target size: 256
+[INFO] Augmentation: disabled
+[INFO] Dataset initialized successfully
+[INFO] Dataset validation passed
+```
+
+#### With Unmatched Files
+
+```
+[INFO] Total images: 3852
+[INFO] Total masks: 3851
+[INFO] Valid pairs: 3850
+[WARNING] Images without masks: 2
+[WARNING] Masks without images: 1
+```
+
+#### Wrong Directory (dataset instead of dataset_final)
+
+```
+[ERROR] Dataset too small! Only 3 valid pairs found.
+[ERROR] Expected: thousands of samples for training.
+[INFO] Found alternative: dataset_final
+[INFO] Try: --image_dir dataset_final/images --mask_dir dataset_final/masks
+[WARNING] 3847 images without masks
+[ERROR] Dataset too small (3 samples) — check directory paths
+```
+
+#### Empty Mask Warning
+
+```
+[WARNING] Empty mask: img0923.npy
+```
 
 ### Command-Line Test
 
 ```bash
-# Basic test
-python3 dataset.py --image_dir dataset/images --mask_dir dataset/masks --visualize
+# Basic test with correct directory
+python3 dataset.py --image_dir dataset_final/images --mask_dir dataset_final/masks
+
+# With 3-panel visualization
+python3 dataset.py --image_dir dataset_final/images --mask_dir dataset_final/masks --visualize
 
 # Test DataLoader
-python3 dataset.py --image_dir dataset/images --mask_dir dataset/masks --batch_size 8 --num_workers 2
+python3 dataset.py --image_dir dataset_final/images --mask_dir dataset_final/masks --batch_size 8 --num_workers 2
+
+# With augmentation
+python3 dataset.py --image_dir dataset_final/images --mask_dir dataset_final/masks --augment --visualize
 ```
 
 ---
@@ -1588,7 +1719,7 @@ dataset = RoofDataset(
 
 ```bash
 # Visualize augmentations
-python3 dataset.py --image_dir dataset/images --mask_dir dataset/masks --augment --visualize
+python3 dataset.py --image_dir dataset_final/images --mask_dir dataset_final/masks --augment --visualize
 ```
 
 ### Visualization Output
@@ -1660,9 +1791,23 @@ Shows side-by-side comparison:
                                  │
                                  ▼
                         ┌─────────────────┐
+                        │  build_dataset  │
+                        │       .py       │
+                        │   (STEP 5)      │
+                        └─────────────────┘
+                                 │
+                                 ▼
+                        ┌─────────────────┐
+                        │  dataset_final/ │
+                        │  ├─ images/     │
+                        │  └─ masks/      │
+                        └─────────────────┘
+                                 │
+                                 ▼
+                        ┌─────────────────┐
                         │    dataset      │
                         │       .py       │
-                        │ (STEP 7-8)      │
+                        │ (STEP 6-8)      │
                         ├─────────────────┤
                         │  1. Load        │
                         │  2. Preprocess  │
@@ -1692,8 +1837,8 @@ Shows side-by-side comparison:
 | **2** | `generate_masks.py` | Single pair | Single mask | Testing/debugging |
 | **3** | `generate_masks_batch.py` | `matched_pairs.json` | `dataset/masks/` | Production batch processing |
 | **4** | `visualize_masks.py` | `dataset/masks/` | Validation report | Verify alignment before training |
-| **5** | `build_dataset.py` | `matched_pairs.json` + masks | `dataset/` | Build clean training structure |
-| **6** | `dataset.py` | `dataset/images/` + `dataset/masks/` | PyTorch DataLoader | Preprocessing + Augmentation for model training |
+| **5** | `build_dataset.py` | `matched_pairs.json` + masks | `dataset_final/` | Build clean training structure |
+| **6** | `dataset.py` | `dataset_final/images/` + `dataset_final/masks/` | PyTorch DataLoader | Preprocessing + Augmentation for model training |
 
 ---
 
@@ -1750,6 +1895,23 @@ python3 generate_masks.py --resize 256
 **Solution**: Ensure write permissions:
 ```bash
 chmod +w dataset/
+```
+
+### Issue: `Dataset too small (3 samples)` or `[ERROR] Dataset too small`
+
+**Cause**: Using `dataset/` instead of `dataset_final/` for training.
+
+**Explanation**:
+- `dataset/masks/` contains intermediate masks during generation
+- `dataset_final/images/` + `dataset_final/masks/` is the CLEAN training set (3,850 pairs)
+
+**Solution**: Use `dataset_final` for training:
+```bash
+# ❌ WRONG - uses intermediate directory
+python3 dataset.py --image_dir dataset/images --mask_dir dataset/masks
+
+# ✅ CORRECT - uses final cleaned dataset
+python3 dataset.py --image_dir dataset_final/images --mask_dir dataset_final/masks
 ```
 
 ### Issue: `ProcessPoolExecutor` errors or worker crashes

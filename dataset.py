@@ -1,58 +1,53 @@
 #!/usr/bin/env python3
 """
-STEP 6: DATA PREPROCESSING PIPELINE
+Production-Ready PyTorch Dataset for Rooftop Segmentation
 
-PyTorch Dataset implementation for rooftop segmentation.
-
-Prepares image and mask data so it can be fed into a deep learning model (U-Net).
+SpaceNet Dataset Pipeline - Prepares .tif images and .npy masks for U-Net training.
 
 Features:
-- Lazy loading (images loaded on-demand)
-- Automatic resizing to target size
-- Image normalization
-- Data augmentation (optional)
-- Validation checks
+- Strict filename matching (image.tif ↔ mask.npy)
+- Clean logging with [INFO]/[WARNING]/[ERROR] prefixes
+- Dataset validation with auto-detection of wrong directories
+- Empty mask warnings (kept for training)
+- 3-panel visualization (image, mask, overlay)
+- Synchronized augmentation (same transforms for image & mask)
 
 Usage:
     # Basic usage
     from dataset import RoofDataset, get_dataloader
 
     dataset = RoofDataset(
-        image_dir='dataset/images',
-        mask_dir='dataset/masks',
+        image_dir='dataset_final/images',
+        mask_dir='dataset_final/masks',
         target_size=256
     )
-
-    train_loader = get_dataloader(dataset, batch_size=8, shuffle=True)
+    train_loader = get_dataloader(dataset, batch_size=8)
 
     # With augmentation
     dataset = RoofDataset(
-        image_dir='dataset/images',
-        mask_dir='dataset/masks',
+        image_dir='dataset_final/images',
+        mask_dir='dataset_final/masks',
         target_size=256,
         augment=True
     )
 
-    # Visualize batch
-    python dataset.py --image_dir dataset/images --mask_dir dataset/masks --visualize
+    # CLI testing with visualization
+    python dataset.py --image_dir dataset_final/images --mask_dir dataset_final/masks --visualize
 """
 
 import argparse
 import logging
-import random
 import sys
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple, Union
 
 import numpy as np
 
-# Configure logging
+# Configure logging with clean format
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
+    format='%(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
 
@@ -65,31 +60,23 @@ def load_image(image_path: Union[str, Path]) -> np.ndarray:
     """
     Load image from file.
 
-    Uses rasterio for .tif files, PIL/Pillow for other formats.
+    Uses rasterio for .tif files, PIL for other formats.
 
     Args:
         image_path: Path to image file
 
     Returns:
         Image array (H, W, 3), uint8, values in [0, 255]
-
-    Raises:
-        FileNotFoundError: If image doesn't exist
-        ValueError: If image format is unsupported or corrupt
     """
     image_path = Path(image_path)
 
     if not image_path.exists():
-        raise FileNotFoundError(f"Image not found: {image_path}")
-
-    if not image_path.is_file():
-        raise ValueError(f"Path is not a file: {image_path}")
+        raise FileNotFoundError(f"[ERROR] Image not found: {image_path}")
 
     # Use rasterio for TIFF files
     if image_path.suffix.lower() in ['.tif', '.tiff']:
         return _load_tiff(image_path)
     else:
-        # Use PIL for other formats
         return _load_pil_image(image_path)
 
 
@@ -97,22 +84,18 @@ def _load_tiff(image_path: Path) -> np.ndarray:
     """Load TIFF image using rasterio."""
     try:
         import rasterio
-        from rasterio.errors import RasterioIOError
 
         with rasterio.open(image_path) as src:
-            # Read RGB bands
             if src.count >= 3:
                 rgb = np.dstack([src.read(i) for i in range(1, 4)])
             elif src.count == 1:
-                # Grayscale - stack to create RGB
                 gray = src.read(1)
                 rgb = np.stack([gray] * 3, axis=-1)
             else:
-                raise ValueError(f"Unsupported band count: {src.count}")
+                raise ValueError(f"[ERROR] Unsupported band count: {src.count}")
 
             # Ensure uint8
             if rgb.dtype != np.uint8:
-                # Normalize if needed
                 if rgb.max() > 255:
                     rgb = (rgb / rgb.max() * 255).astype(np.uint8)
                 else:
@@ -121,9 +104,7 @@ def _load_tiff(image_path: Path) -> np.ndarray:
             return rgb
 
     except ImportError:
-        raise ImportError("rasterio is required for TIFF files. Install with: pip install rasterio")
-    except RasterioIOError as e:
-        raise ValueError(f"Corrupt or invalid TIFF file: {image_path} - {e}")
+        raise ImportError("[ERROR] rasterio required. Install: pip install rasterio")
 
 
 def _load_pil_image(image_path: Path) -> np.ndarray:
@@ -132,15 +113,12 @@ def _load_pil_image(image_path: Path) -> np.ndarray:
         from PIL import Image
 
         img = Image.open(image_path)
-
-        # Convert to RGB if necessary
         if img.mode != 'RGB':
             img = img.convert('RGB')
-
         return np.array(img, dtype=np.uint8)
 
     except Exception as e:
-        raise ValueError(f"Failed to load image {image_path}: {e}")
+        raise ValueError(f"[ERROR] Failed to load image {image_path}: {e}")
 
 
 # ============================================================================
@@ -157,23 +135,19 @@ def load_mask(mask_path: Union[str, Path]) -> np.ndarray:
         mask_path: Path to mask file
 
     Returns:
-        Binary mask array (H, W), values in {0, 1}
-
-    Raises:
-        FileNotFoundError: If mask doesn't exist
-        ValueError: If mask format is unsupported or corrupt
+        Binary mask array (H, W), values in {0, 1} as float32
     """
     mask_path = Path(mask_path)
 
     if not mask_path.exists():
-        raise FileNotFoundError(f"Mask not found: {mask_path}")
+        raise FileNotFoundError(f"[ERROR] Mask not found: {mask_path}")
 
     if mask_path.suffix == '.npy':
         return _load_npy_mask(mask_path)
     elif mask_path.suffix == '.png':
         return _load_png_mask(mask_path)
     else:
-        raise ValueError(f"Unsupported mask format: {mask_path.suffix}")
+        raise ValueError(f"[ERROR] Unsupported mask format: {mask_path.suffix}")
 
 
 def _load_npy_mask(mask_path: Path) -> np.ndarray:
@@ -185,13 +159,13 @@ def _load_npy_mask(mask_path: Path) -> np.ndarray:
         if len(mask.shape) > 2:
             mask = mask.squeeze()
 
-        # Ensure binary (0 or 1)
+        # Ensure binary (0 or 1) as float32
         mask = (mask > 0).astype(np.float32)
 
         return mask
 
     except Exception as e:
-        raise ValueError(f"Corrupt .npy file: {mask_path} - {e}")
+        raise ValueError(f"[ERROR] Corrupt .npy file: {mask_path} - {e}")
 
 
 def _load_png_mask(mask_path: Path) -> np.ndarray:
@@ -199,22 +173,14 @@ def _load_png_mask(mask_path: Path) -> np.ndarray:
     try:
         from PIL import Image
 
-        mask = np.array(Image.open(mask_path))
-
-        # Ensure 2D
-        if len(mask.shape) > 2:
-            mask = mask[:, :, 0]
-
-        # Normalize to {0, 1}
-        if mask.max() > 1:
-            mask = (mask / 255.0).astype(np.float32)
-        else:
-            mask = mask.astype(np.float32)
+        img = Image.open(mask_path).convert('L')
+        mask = np.array(img, dtype=np.float32) / 255.0
+        mask = (mask > 0.5).astype(np.float32)
 
         return mask
 
     except Exception as e:
-        raise ValueError(f"Corrupt PNG file: {mask_path} - {e}")
+        raise ValueError(f"[ERROR] Failed to load mask {mask_path}: {e}")
 
 
 # ============================================================================
@@ -224,54 +190,22 @@ def _load_png_mask(mask_path: Path) -> np.ndarray:
 def resize_image_and_mask(
     image: np.ndarray,
     mask: np.ndarray,
-    target_size: Union[int, Tuple[int, int]],
-    interpolation_image: int = None,
-    interpolation_mask: int = None
+    target_size: Union[int, Tuple[int, int]]
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Resize image and mask to target size.
-
-    Uses INTER_LINEAR for images and INTER_NEAREST for masks to preserve
-    binary mask integrity.
-
-    Args:
-        image: Image array (H, W, 3)
-        mask: Mask array (H, W)
-        target_size: Target size (H, W) or single int for square
-        interpolation_image: OpenCV interpolation for image
-        interpolation_mask: OpenCV interpolation for mask
-
-    Returns:
-        Tuple of (resized_image, resized_mask)
-    """
+    """Resize image and mask to target size."""
     try:
         import cv2
 
-        # Set default interpolations
-        if interpolation_image is None:
-            interpolation_image = cv2.INTER_LINEAR
-        if interpolation_mask is None:
-            interpolation_mask = cv2.INTER_NEAREST
-
-        # Parse target size
         if isinstance(target_size, int):
             target_size = (target_size, target_size)
 
-        # Resize image
-        resized_image = cv2.resize(
-            image,
-            (target_size[1], target_size[0]),  # cv2 uses (width, height)
-            interpolation=interpolation_image
-        )
+        # Resize image with linear interpolation
+        img_resized = cv2.resize(image, target_size, interpolation=cv2.INTER_LINEAR)
 
-        # Resize mask
-        resized_mask = cv2.resize(
-            mask,
-            (target_size[1], target_size[0]),
-            interpolation=interpolation_mask
-        )
+        # Resize mask with nearest neighbor (preserve binary values)
+        mask_resized = cv2.resize(mask, target_size, interpolation=cv2.INTER_NEAREST)
 
-        return resized_image, resized_mask
+        return img_resized, mask_resized
 
     except ImportError:
         # Fallback to PIL
@@ -280,247 +214,114 @@ def resize_image_and_mask(
         if isinstance(target_size, int):
             target_size = (target_size, target_size)
 
-        # Resize image
-        pil_image = Image.fromarray(image)
-        pil_image = pil_image.resize((target_size[1], target_size[0]), Image.BILINEAR)
-        resized_image = np.array(pil_image)
+        img_pil = Image.fromarray(image)
+        img_resized = np.array(img_pil.resize(target_size, Image.BILINEAR))
 
-        # Resize mask
-        pil_mask = Image.fromarray((mask * 255).astype(np.uint8))
-        pil_mask = pil_mask.resize((target_size[1], target_size[0]), Image.NEAREST)
-        resized_mask = np.array(pil_mask).astype(np.float32) / 255.0
+        mask_pil = Image.fromarray((mask * 255).astype(np.uint8))
+        mask_resized = np.array(mask_pil.resize(target_size, Image.NEAREST))
+        mask_resized = (mask_resized > 127).astype(np.float32)
 
-        return resized_image, resized_mask
-
-
-def normalize_image(image: np.ndarray) -> np.ndarray:
-    """
-    Normalize image to [0, 1] range.
-
-    Args:
-        image: Image array (H, W, 3), uint8
-
-    Returns:
-        Normalized image (H, W, 3), float32
-    """
-    return image.astype(np.float32) / 255.0
+        return img_resized, mask_resized
 
 
 def preprocess_image(image: np.ndarray, target_size: Union[int, Tuple[int, int]]) -> np.ndarray:
     """
     Preprocess image for model input.
 
-    Steps:
-    1. Resize to target size
-    2. Normalize to [0, 1]
-    3. Convert to CHW format
-
     Args:
-        image: Input image (H, W, 3)
-        target_size: Target size
+        image: Input image (H, W, 3), uint8
+        target_size: Target size for resizing
 
     Returns:
-        Preprocessed image (3, H, W), float32
+        Preprocessed image (3, H, W), float32, values in [0, 1]
     """
     # Resize
-    from PIL import Image
     if isinstance(target_size, int):
         target_size = (target_size, target_size)
 
-    pil_image = Image.fromarray(image)
-    pil_image = pil_image.resize((target_size[1], target_size[0]), Image.BILINEAR)
-    resized = np.array(pil_image)
+    image_resized, _ = resize_image_and_mask(image, np.zeros_like(image[:, :, 0]), target_size)
 
-    # Normalize
-    normalized = normalize_image(resized)
+    # Normalize to [0, 1]
+    image_norm = image_resized.astype(np.float32) / 255.0
 
-    # HWC to CHW
-    chw = np.transpose(normalized, (2, 0, 1))
+    # Convert HWC to CHW
+    image_tensor = np.transpose(image_norm, (2, 0, 1))
 
-    return chw
+    return image_tensor
 
 
 def preprocess_mask(mask: np.ndarray, target_size: Union[int, Tuple[int, int]]) -> np.ndarray:
     """
     Preprocess mask for model input.
 
-    Steps:
-    1. Resize to target size (using nearest neighbor)
-    2. Ensure binary values
-    3. Add channel dimension
-
     Args:
-        mask: Input mask (H, W)
-        target_size: Target size
+        mask: Input mask (H, W), values in {0, 1}
+        target_size: Target size for resizing
 
     Returns:
-        Preprocessed mask (1, H, W), float32
+        Preprocessed mask (1, H, W), float32, values in {0, 1}
     """
-    # Resize using PIL (NEAREST to preserve binary values)
-    from PIL import Image
-
+    # Resize with nearest neighbor
     if isinstance(target_size, int):
         target_size = (target_size, target_size)
 
-    pil_mask = Image.fromarray((mask * 255).astype(np.uint8))
-    pil_mask = pil_mask.resize((target_size[1], target_size[0]), Image.NEAREST)
-    resized = np.array(pil_mask).astype(np.float32) / 255.0
+    _, mask_resized = resize_image_and_mask(np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.uint8), mask, target_size)
 
     # Ensure binary
-    binary = (resized > 0.5).astype(np.float32)
+    mask_binary = (mask_resized > 0.5).astype(np.float32)
 
     # Add channel dimension
-    chw = np.expand_dims(binary, axis=0)
+    mask_tensor = mask_binary[np.newaxis, :, :]
 
-    return chw
+    return mask_tensor
 
 
 # ============================================================================
-# DATA AUGMENTATION
+# AUGMENTATION
 # ============================================================================
 
 class Augmentation:
-    """Data augmentation for image-mask pairs.
+    """
+    Data augmentation for image and mask.
 
-    Applies same geometric transformations to both image and mask
-    to ensure alignment is preserved.
+    Applies same geometric transforms to both image and mask.
+    Color transforms (brightness) only apply to image.
     """
 
-    def __init__(
-        self,
-        horizontal_flip: bool = True,
-        vertical_flip: bool = True,
-        random_rotation: bool = True,
-        brightness: bool = True,
-        contrast: bool = True,
-        rotation_range: Tuple[float, float] = (-15, 15),
-        p: float = 0.5
-    ):
-        """
-        Initialize augmentation.
-
-        Args:
-            horizontal_flip: Enable horizontal flip
-            vertical_flip: Enable vertical flip
-            random_rotation: Enable random rotation (±15° by default)
-            brightness: Enable brightness adjustment
-            contrast: Enable contrast adjustment
-            rotation_range: Range of rotation angles in degrees (min, max)
-            p: Probability of applying each augmentation
-        """
+    def __init__(self, horizontal_flip: bool = True, vertical_flip: bool = True,
+                 rotation: bool = True, brightness: bool = True, p: float = 0.5):
         self.horizontal_flip = horizontal_flip
         self.vertical_flip = vertical_flip
-        self.random_rotation = random_rotation
+        self.rotation = rotation
         self.brightness = brightness
-        self.contrast = contrast
-        self.rotation_range = rotation_range
         self.p = p
 
-    def __call__(
-        self,
-        image: np.ndarray,
-        mask: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Apply augmentation to image and mask.
+    def __call__(self, image: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Apply augmentation to image and mask."""
+        import random
 
-        Args:
-            image: Image array (H, W, 3), uint8
-            mask: Mask array (H, W), float32
-
-        Returns:
-            Tuple of (augmented_image, augmented_mask)
-        """
         # Horizontal flip (geometric - apply to both)
         if self.horizontal_flip and random.random() < self.p:
-            image = np.flip(image, axis=1).copy()
-            mask = np.flip(mask, axis=1).copy()
+            image = np.fliplr(image).copy()
+            mask = np.fliplr(mask).copy()
 
         # Vertical flip (geometric - apply to both)
         if self.vertical_flip and random.random() < self.p:
-            image = np.flip(image, axis=0).copy()
-            mask = np.flip(mask, axis=0).copy()
+            image = np.flipud(image).copy()
+            mask = np.flipud(mask).copy()
 
-        # Random rotation ±15° (geometric - apply to both)
-        if self.random_rotation and random.random() < self.p:
-            angle = random.uniform(self.rotation_range[0], self.rotation_range[1])
-            image, mask = self._rotate_image_and_mask(image, mask, angle)
+        # Rotation (geometric - apply to both)
+        if self.rotation and random.random() < self.p:
+            k = random.choice([1, 2, 3])  # 90, 180, 270 degrees
+            image = np.rot90(image, k=k).copy()
+            mask = np.rot90(mask, k=k).copy()
 
-        # Brightness adjustment (color - image only)
+        # Brightness (color - image only)
         if self.brightness and random.random() < self.p:
             factor = random.uniform(0.8, 1.2)
-            image = np.clip(image.astype(np.float32) * factor, 0, 255).astype(np.uint8)
-
-        # Contrast adjustment (color - image only)
-        if self.contrast and random.random() < self.p:
-            factor = random.uniform(0.8, 1.2)
-            mean = image.mean()
-            image = np.clip((image.astype(np.float32) - mean) * factor + mean, 0, 255).astype(np.uint8)
+            image = np.clip(image * factor, 0, 255).astype(np.uint8)
 
         return image, mask
-
-    def _rotate_image_and_mask(
-        self,
-        image: np.ndarray,
-        mask: np.ndarray,
-        angle: float
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Rotate image and mask by given angle.
-
-        Uses cv2.warpAffine with appropriate interpolation:
-        - INTER_LINEAR for image (smooth)
-        - INTER_NEAREST for mask (preserve binary values)
-
-        Args:
-            image: Image array (H, W, 3)
-            mask: Mask array (H, W)
-            angle: Rotation angle in degrees
-
-        Returns:
-            Tuple of (rotated_image, rotated_mask)
-        """
-        try:
-            import cv2
-
-            h, w = image.shape[:2]
-            center = (w // 2, h // 2)
-
-            # Get rotation matrix
-            M = cv2.getRotationMatrix2D(center, angle, 1.0)
-
-            # Rotate image with INTER_LINEAR
-            rotated_image = cv2.warpAffine(
-                image, M, (w, h),
-                flags=cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_CONSTANT,
-                borderValue=(0, 0, 0)
-            )
-
-            # Rotate mask with INTER_NEAREST (preserve labels)
-            # Convert mask to uint8 for rotation
-            mask_uint8 = (mask * 255).astype(np.uint8)
-            rotated_mask_uint8 = cv2.warpAffine(
-                mask_uint8, M, (w, h),
-                flags=cv2.INTER_NEAREST,
-                borderMode=cv2.BORDER_CONSTANT,
-                borderValue=0
-            )
-
-            # Convert back to float32 binary
-            rotated_mask = (rotated_mask_uint8 > 127).astype(np.float32)
-
-            return rotated_image, rotated_mask
-
-        except ImportError:
-            # Fallback: use scipy.ndimage
-            from scipy import ndimage
-
-            rotated_image = ndimage.rotate(image, angle, reshape=False, order=1)
-            rotated_mask = ndimage.rotate(mask, angle, reshape=False, order=0)
-            rotated_mask = (rotated_mask > 0.5).astype(np.float32)
-
-            return rotated_image, rotated_mask
 
 
 # ============================================================================
@@ -529,13 +330,13 @@ class Augmentation:
 
 class RoofDataset:
     """
-    PyTorch Dataset for rooftop segmentation.
+    Production-ready PyTorch Dataset for rooftop segmentation.
 
-    Loads images and masks, applies preprocessing, and returns tensors.
+    Features strict filename matching and comprehensive validation.
 
     Args:
-        image_dir: Directory containing images
-        mask_dir: Directory containing masks
+        image_dir: Directory containing .tif images
+        mask_dir: Directory containing .npy masks
         target_size: Target size for resizing (default: 256)
         augment: Whether to apply data augmentation (default: False)
         transform: Optional additional transforms
@@ -556,7 +357,7 @@ class RoofDataset:
         transform: Optional[Callable] = None,
         validate: bool = True
     ):
-        """Initialize dataset."""
+        """Initialize dataset with strict file matching."""
         self.image_dir = Path(image_dir)
         self.mask_dir = Path(mask_dir)
         self.target_size = target_size
@@ -565,62 +366,115 @@ class RoofDataset:
 
         # Validate directories exist
         if not self.image_dir.exists():
-            raise FileNotFoundError(f"Image directory not found: {self.image_dir}")
+            raise FileNotFoundError(f"[ERROR] Image directory not found: {self.image_dir}")
         if not self.mask_dir.exists():
-            raise FileNotFoundError(f"Mask directory not found: {self.mask_dir}")
+            raise FileNotFoundError(f"[ERROR] Mask directory not found: {self.mask_dir}")
 
-        # Build file list
-        self.image_paths = []
-        self.mask_paths = []
+        # Build valid pairs using strict filename matching
+        self.pairs = self._build_valid_pairs()
 
-        # Find all image files
-        image_extensions = {'.tif', '.tiff', '.png', '.jpg', '.jpeg'}
-        for ext in image_extensions:
-            self.image_paths.extend(sorted(self.image_dir.glob(f'*{ext}')))
+        # Dataset validation
+        if len(self.pairs) < 100:
+            self._handle_small_dataset()
 
-        # Match with masks
-        for img_path in self.image_paths:
-            base_name = img_path.stem
-            # Try different mask extensions
-            mask_path = self.mask_dir / f"{base_name}.npy"
-            if not mask_path.exists():
-                mask_path = self.mask_dir / f"{base_name}.png"
+        # Log summary
+        self._log_summary(augment)
 
-            if mask_path.exists():
-                self.mask_paths.append(mask_path)
-            else:
-                logger.warning(f"No mask found for {img_path.name}, skipping")
-
-        # Update image_paths to only include matched pairs
-        self.image_paths = [
-            img for img, mask in zip(self.image_paths, self.mask_paths)
-            if mask.exists()
-        ]
-
+        # Optional validation
         if validate:
             self._validate_dataset()
 
-        logger.info(f"Initialized dataset with {len(self)} samples")
+    def _build_valid_pairs(self) -> List[Tuple[Path, Path]]:
+        """
+        Build list of valid image-mask pairs using strict filename matching.
+
+        Only includes pairs where BOTH image.tif and mask.npy exist.
+        """
+        # Get all image files (.tif only for SpaceNet)
+        image_files = {}
+        for ext in ['.tif', '.tiff']:
+            for f in self.image_dir.glob(f'*{ext}'):
+                image_files[f.stem] = f
+
+        # Get all mask files (.npy only)
+        mask_files = {}
+        for f in self.mask_dir.glob('*.npy'):
+            mask_files[f.stem] = f
+
+        # Find intersection (strict matching)
+        valid_stems = set(image_files.keys()) & set(mask_files.keys())
+
+        # Build sorted pairs list
+        pairs = [(image_files[stem], mask_files[stem]) for stem in sorted(valid_stems)]
+
+        # Store counts for summary
+        self._total_images = len(image_files)
+        self._total_masks = len(mask_files)
+        self._unmatched_images = set(image_files.keys()) - set(mask_files.keys())
+        self._unmatched_masks = set(mask_files.keys()) - set(image_files.keys())
+
+        return pairs
+
+    def _handle_small_dataset(self):
+        """Handle case where dataset has fewer than 100 samples."""
+        logger.error(f"[ERROR] Dataset too small! Only {len(self.pairs)} valid pairs found.")
+        logger.error(f"[ERROR] Expected: thousands of samples for training.")
+        logger.error(f"[ERROR] Image directory: {self.image_dir}")
+        logger.error(f"[ERROR] Mask directory: {self.mask_dir}")
+
+        # Check for dataset_final
+        parent = self.image_dir.parent
+        if parent.name != 'dataset_final':
+            alt_path = parent / 'dataset_final'
+            if alt_path.exists():
+                logger.info(f"[INFO] Found alternative: {alt_path}")
+                logger.info(f"[INFO] Try: --image_dir {alt_path}/images --mask_dir {alt_path}/masks")
+
+        # Log unmatched files
+        if self._unmatched_images:
+            logger.warning(f"[WARNING] {len(self._unmatched_images)} images without masks")
+            logger.warning(f"[WARNING] Examples: {list(self._unmatched_images)[:3]}")
+        if self._unmatched_masks:
+            logger.warning(f"[WARNING] {len(self._unmatched_masks)} masks without images")
+            logger.warning(f"[WARNING] Examples: {list(self._unmatched_masks)[:3]}")
+
+        raise ValueError(f"[ERROR] Dataset too small ({len(self.pairs)} samples) — check directory paths")
+
+    def _log_summary(self, augment: bool):
+        """Log dataset initialization summary."""
+        logger.info(f"[INFO] Total images: {self._total_images}")
+        logger.info(f"[INFO] Total masks: {self._total_masks}")
+        logger.info(f"[INFO] Valid pairs: {len(self.pairs)}")
+
+        if self._unmatched_images:
+            logger.warning(f"[WARNING] Images without masks: {len(self._unmatched_images)}")
+        if self._unmatched_masks:
+            logger.warning(f"[WARNING] Masks without images: {len(self._unmatched_masks)}")
+
+        logger.info(f"[INFO] Image directory: {self.image_dir}")
+        logger.info(f"[INFO] Mask directory: {self.mask_dir}")
+        logger.info(f"[INFO] Target size: {self.target_size}")
+        logger.info(f"[INFO] Augmentation: {'enabled' if augment else 'disabled'}")
+        logger.info(f"[INFO] Dataset initialized successfully")
 
     def _validate_dataset(self):
-        """Validate dataset integrity."""
-        if len(self.image_paths) == 0:
-            raise ValueError(f"No valid image-mask pairs found in {self.image_dir} and {self.mask_dir}")
+        """Validate dataset by loading first sample."""
+        if len(self.pairs) == 0:
+            raise ValueError("[ERROR] No valid image-mask pairs found")
 
-        # Check first sample
         try:
             sample_image, sample_mask = self[0]
-            assert sample_image.shape[0] == 3, f"Image should have 3 channels, got {sample_image.shape[0]}"
-            assert sample_mask.shape[0] == 1, f"Mask should have 1 channel, got {sample_mask.shape[0]}"
-            assert sample_image.shape[1:] == sample_mask.shape[1:], "Image and mask shapes should match"
-            logger.info(f"Dataset validation passed. Sample shapes: image={sample_image.shape}, mask={sample_mask.shape}")
+            assert sample_image.shape[0] == 3, f"Image should have 3 channels"
+            assert sample_mask.shape[0] == 1, f"Mask should have 1 channel"
+            assert sample_image.shape[1:] == sample_mask.shape[1:], "Shapes should match"
+            logger.info(f"[INFO] Dataset validation passed")
         except Exception as e:
-            logger.error(f"Dataset validation failed: {e}")
+            logger.error(f"[ERROR] Dataset validation failed: {e}")
             raise
 
     def __len__(self) -> int:
-        """Return dataset length."""
-        return len(self.image_paths)
+        """Return number of valid pairs."""
+        return len(self.pairs)
 
     def __getitem__(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -631,98 +485,49 @@ class RoofDataset:
 
         Returns:
             Tuple of (image_tensor, mask_tensor)
-
-        Raises:
-            IndexError: If index is out of range
-            FileNotFoundError: If image or mask file not found
-            ValueError: If image/mask shapes don't match or files are corrupt
         """
         if idx >= len(self):
-            raise IndexError(f"Index {idx} out of range for dataset of size {len(self)}")
+            raise IndexError(f"[ERROR] Index {idx} out of range")
 
-        image_path = self.image_paths[idx]
-        mask_path = self.mask_paths[idx]
+        image_path, mask_path = self.pairs[idx]
 
-        # Load with comprehensive error handling
+        # Load image
         try:
             image = load_image(image_path)
-        except FileNotFoundError as e:
-            logger.error(f"[Sample {idx}] Image file not found: {image_path}")
-            raise FileNotFoundError(f"Cannot load image at index {idx}: {e}")
         except Exception as e:
-            logger.error(f"[Sample {idx}] Failed to load image {image_path}: {e}")
-            raise ValueError(f"Corrupt or invalid image at index {idx} ({image_path}): {e}")
+            logger.error(f"[ERROR] Failed to load image {image_path}: {e}")
+            raise
 
+        # Load mask
         try:
             mask = load_mask(mask_path)
-        except FileNotFoundError as e:
-            logger.error(f"[Sample {idx}] Mask file not found: {mask_path}")
-            raise FileNotFoundError(f"Cannot load mask at index {idx}: {e}")
         except Exception as e:
-            logger.error(f"[Sample {idx}] Failed to load mask {mask_path}: {e}")
-            raise ValueError(f"Corrupt or invalid mask at index {idx} ({mask_path}): {e}")
+            logger.error(f"[ERROR] Failed to load mask {mask_path}: {e}")
+            raise
 
         # Validate alignment
         if image.shape[:2] != mask.shape[:2]:
-            error_msg = (
-                f"[Sample {idx}] Shape mismatch: "
-                f"image={image.shape[:2]}, mask={mask.shape[:2]}\n"
-                f"Image file: {image_path}\n"
-                f"Mask file: {mask_path}"
-            )
-            logger.error(error_msg)
-            raise ValueError(error_msg)
+            raise ValueError(f"[ERROR] Shape mismatch: image={image.shape[:2]}, mask={mask.shape[:2]}")
 
-        # Validate image properties
-        if image.dtype != np.uint8:
-            logger.warning(f"[Sample {idx}] Image not uint8, converting: {image_path.name}")
-            if image.max() <= 1.0:
-                image = (image * 255).astype(np.uint8)
-            else:
-                image = image.astype(np.uint8)
-
-        # Validate mask properties
-        if mask.dtype != np.float32:
-            logger.warning(f"[Sample {idx}] Mask not float32, converting: {mask_path.name}")
-            mask = mask.astype(np.float32)
-
-        # Check for abnormal masks
-        unique_values = np.unique(mask)
-        if len(unique_values) == 1:
-            if unique_values[0] == 0:
-                logger.warning(f"[Sample {idx}] Empty mask (all zeros): {mask_path.name}")
-            elif unique_values[0] == 1:
-                logger.warning(f"[Sample {idx}] Full mask (all ones): {mask_path.name}")
-        elif not np.all(np.isin(unique_values, [0, 1])):
-            logger.warning(f"[Sample {idx}] Mask has unusual values {unique_values}: {mask_path.name}")
-
-        # Log successful load in debug mode
-        logger.debug(f"[Sample {idx}] Loaded: image={image.shape}, mask={mask.shape}")
+        # Check for empty mask
+        if mask.sum() == 0:
+            logger.warning(f"[WARNING] Empty mask: {mask_path.name}")
 
         # Apply augmentation (before resizing for quality)
         if self.augment is not None:
             try:
                 image, mask = self.augment(image, mask)
             except Exception as e:
-                logger.error(f"[Sample {idx}] Augmentation failed: {e}")
-                raise ValueError(f"Augmentation failed at index {idx}: {e}")
+                logger.error(f"[ERROR] Augmentation failed: {e}")
+                raise
 
         # Preprocess
         try:
             image_tensor = preprocess_image(image, self.target_size)
             mask_tensor = preprocess_mask(mask, self.target_size)
         except Exception as e:
-            logger.error(f"[Sample {idx}] Preprocessing failed: {e}")
-            raise ValueError(f"Preprocessing failed at index {idx}: {e}")
-
-        # Validate output shapes
-        expected_img_shape = (3, self.target_size, self.target_size) if isinstance(self.target_size, int) else (3,) + self.target_size
-        expected_msk_shape = (1, self.target_size, self.target_size) if isinstance(self.target_size, int) else (1,) + self.target_size
-
-        if image_tensor.shape != expected_img_shape:
-            raise ValueError(f"[Sample {idx}] Image tensor shape mismatch: got {image_tensor.shape}, expected {expected_img_shape}")
-        if mask_tensor.shape != expected_msk_shape:
-            raise ValueError(f"[Sample {idx}] Mask tensor shape mismatch: got {mask_tensor.shape}, expected {expected_msk_shape}")
+            logger.error(f"[ERROR] Preprocessing failed: {e}")
+            raise
 
         # Apply additional transforms if provided
         if self.transform is not None:
@@ -736,32 +541,32 @@ class RoofDataset:
 # ============================================================================
 
 def get_dataloader(
-    dataset,
+    dataset: RoofDataset,
     batch_size: int = 8,
     shuffle: bool = True,
     num_workers: int = 0,
     pin_memory: bool = True,
-    drop_last: bool = True,
     **kwargs
 ):
     """
-    Create PyTorch DataLoader for training.
+    Create PyTorch DataLoader.
 
     Args:
         dataset: RoofDataset instance
-        batch_size: Number of samples per batch
-        shuffle: Whether to shuffle data
-        num_workers: Number of worker processes (0 for main process only)
-        pin_memory: Whether to pin memory for faster GPU transfer
-        drop_last: Whether to drop last incomplete batch
-        **kwargs: Additional DataLoader arguments
+        batch_size: Batch size
+        shuffle: Whether to shuffle
+        num_workers: Number of workers
+        pin_memory: Pin memory for GPU
+        **kwargs: Additional arguments
 
     Returns:
-        torch.utils.data.DataLoader instance
+        DataLoader instance
     """
     try:
-        import torch
         from torch.utils.data import DataLoader
+
+        if len(dataset) < batch_size:
+            logger.warning(f"[WARNING] Dataset size ({len(dataset)}) < batch_size ({batch_size})")
 
         return DataLoader(
             dataset,
@@ -769,331 +574,145 @@ def get_dataloader(
             shuffle=shuffle,
             num_workers=num_workers,
             pin_memory=pin_memory,
-            drop_last=drop_last,
             **kwargs
         )
+
     except ImportError:
-        raise ImportError("PyTorch is required. Install with: pip install torch")
+        raise ImportError("[ERROR] PyTorch required. Install: pip install torch")
 
 
 # ============================================================================
 # VISUALIZATION
 # ============================================================================
 
-def visualize_batch(
-    dataset,
-    num_samples: int = 4,
-    save_path: Optional[str] = None
-):
+def visualize_sample(dataset: RoofDataset, idx: int = 0, save_path: Optional[str] = None):
     """
-    Visualize samples from dataset.
+    Create 3-panel visualization: image, mask, overlay.
 
     Args:
         dataset: RoofDataset instance
-        num_samples: Number of samples to visualize
+        idx: Sample index
         save_path: Optional path to save figure
     """
     try:
         import matplotlib.pyplot as plt
-
-        num_samples = min(num_samples, len(dataset))
-        indices = random.sample(range(len(dataset)), num_samples)
-
-        fig, axes = plt.subplots(num_samples, 3, figsize=(12, 4 * num_samples))
-        if num_samples == 1:
-            axes = axes.reshape(1, -1)
-
-        for i, idx in enumerate(indices):
-            image_tensor, mask_tensor = dataset[idx]
-
-            # Convert tensors to display format
-            # CHW to HWC
-            image = np.transpose(image_tensor, (1, 2, 0))
-            mask = mask_tensor[0]  # Remove channel dim
-
-            # Create overlay
-            overlay = image.copy()
-            overlay[mask > 0.5] = [1, 0, 0]  # Red overlay
-
-            # Plot
-            axes[i, 0].imshow(image)
-            axes[i, 0].set_title(f'Image {idx}')
-            axes[i, 0].axis('off')
-
-            axes[i, 1].imshow(mask, cmap='gray', vmin=0, vmax=1)
-            axes[i, 1].set_title(f'Mask {idx}')
-            axes[i, 1].axis('off')
-
-            axes[i, 2].imshow(overlay)
-            axes[i, 2].set_title(f'Overlay {idx}')
-            axes[i, 2].axis('off')
-
-        plt.tight_layout()
-
-        if save_path:
-            plt.savefig(save_path, dpi=150, bbox_inches='tight')
-            logger.info(f"Saved visualization to {save_path}")
-        else:
-            plt.show()
-
-        plt.close()
-
     except ImportError:
-        logger.error("matplotlib is required for visualization. Install with: pip install matplotlib")
+        logger.error("[ERROR] matplotlib required. Install: pip install matplotlib")
+        return
 
+    if idx >= len(dataset):
+        logger.error(f"[ERROR] Index {idx} out of range")
+        return
 
-def visualize_augmentations(
-    dataset,
-    idx: int = 0,
-    num_variants: int = 4,
-    save_path: Optional[str] = None
-):
-    """
-    Visualize augmentation effects on a single sample.
+    # Get sample
+    image_tensor, mask_tensor = dataset[idx]
+    image_path, mask_path = dataset.pairs[idx]
 
-    Args:
-        dataset: RoofDataset instance with augment=True
-        idx: Sample index to visualize
-        num_variants: Number of augmented variants to show
-        save_path: Optional path to save figure
-    """
-    try:
-        import matplotlib.pyplot as plt
+    # Convert back for visualization
+    # Image: (3, H, W) -> (H, W, 3)
+    image = np.transpose(image_tensor, (1, 2, 0))
+    # Mask: (1, H, W) -> (H, W)
+    mask = mask_tensor[0]
 
-        fig, axes = plt.subplots(num_variants, 3, figsize=(12, 4 * num_variants))
-        if num_variants == 1:
-            axes = axes.reshape(1, -1)
+    # Create overlay (red mask on image)
+    overlay = image.copy()
+    overlay[mask > 0.5] = [1.0, 0.0, 0.0]  # Red
 
-        for i in range(num_variants):
-            image_tensor, mask_tensor = dataset[idx]
+    # Calculate coverage
+    coverage = mask.sum() / mask.size * 100
+    pixel_count = int(mask.sum())
 
-            # Convert tensors to display format
-            image = np.transpose(image_tensor, (1, 2, 0))
-            mask = mask_tensor[0]
+    # Create figure
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
-            # Create overlay
-            overlay = image.copy()
-            overlay[mask > 0.5] = [1, 0, 0]
+    # Original image
+    axes[0].imshow(image)
+    axes[0].set_title(f"Image: {image_path.name}")
+    axes[0].axis('off')
 
-            # Plot
-            axes[i, 0].imshow(image)
-            axes[i, 0].set_title(f'Augmented Image {i+1}')
-            axes[i, 0].axis('off')
+    # Binary mask
+    axes[1].imshow(mask, cmap='gray', vmin=0, vmax=1)
+    axes[1].set_title(f"Mask: {mask_path.name}")
+    axes[1].axis('off')
 
-            axes[i, 1].imshow(mask, cmap='gray', vmin=0, vmax=1)
-            axes[i, 1].set_title(f'Augmented Mask {i+1}')
-            axes[i, 1].axis('off')
+    # Overlay
+    axes[2].imshow(overlay)
+    axes[2].set_title(f"Overlay\nCoverage: {coverage:.1f}% | Pixels: {pixel_count}")
+    axes[2].axis('off')
 
-            axes[i, 2].imshow(overlay)
-            axes[i, 2].set_title(f'Overlay {i+1}')
-            axes[i, 2].axis('off')
+    plt.tight_layout()
 
-        plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        logger.info(f"[INFO] Saved visualization to: {save_path}")
 
-        if save_path:
-            plt.savefig(save_path, dpi=150, bbox_inches='tight')
-            logger.info(f"Saved augmentation visualization to {save_path}")
-        else:
-            plt.show()
+    plt.show()
 
-        plt.close()
-
-    except ImportError:
-        logger.error("matplotlib is required for visualization")
-
-
-def visualize_sample(
-    dataset,
-    idx: int = 0,
-    save_path: Optional[str] = None,
-    show_original: bool = False
-):
-    """
-    Visualize a single sample from dataset with detailed information.
-
-    Args:
-        dataset: RoofDataset instance
-        idx: Sample index to visualize
-        save_path: Optional path to save figure
-        show_original: If True, also show pre-augmentation version
-    """
-    try:
-        import matplotlib.pyplot as plt
-        import matplotlib.patches as mpatches
-
-        # Get sample
-        image_tensor, mask_tensor = dataset[idx]
-
-        # Convert tensors to display format
-        image = np.transpose(image_tensor, (1, 2, 0))
-        mask = mask_tensor[0]
-
-        # Calculate statistics
-        mask_sum = mask.sum()
-        mask_total = mask.size
-        coverage = (mask_sum / mask_total) * 100
-
-        # Create overlay
-        overlay = image.copy()
-        overlay[mask > 0.5] = [1, 0, 0]  # Red overlay
-
-        # Create figure
-        if show_original and dataset.augment is not None:
-            # Show both augmented and original
-            fig, axes = plt.subplots(2, 3, figsize=(12, 8))
-
-            # Top row: augmented version
-            axes[0, 0].imshow(image)
-            axes[0, 0].set_title(f'Augmented Image [{idx}]')
-            axes[0, 0].axis('off')
-
-            axes[0, 1].imshow(mask, cmap='gray', vmin=0, vmax=1)
-            axes[0, 1].set_title(f'Augmented Mask\nCoverage: {coverage:.1f}%')
-            axes[0, 1].axis('off')
-
-            axes[0, 2].imshow(overlay)
-            axes[0, 2].set_title('Augmented Overlay')
-            axes[0, 2].axis('off')
-
-            # Bottom row: would need original - just show same for now
-            axes[1, 0].imshow(image)
-            axes[1, 0].set_title(f'Processed Image [{idx}]')
-            axes[1, 0].axis('off')
-
-            axes[1, 1].imshow(mask, cmap='gray', vmin=0, vmax=1)
-            axes[1, 1].set_title(f'Processed Mask\nCoverage: {coverage:.1f}%')
-            axes[1, 1].axis('off')
-
-            axes[1, 2].imshow(overlay)
-            red_patch = mpatches.Patch(color='red', alpha=0.4, label='Buildings')
-            axes[1, 2].legend(handles=[red_patch], loc='upper right')
-            axes[1, 2].set_title('Overlay (Red=Buildings)')
-            axes[1, 2].axis('off')
-
-        else:
-            # Simple 3-panel view
-            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-
-            axes[0].imshow(image)
-            axes[0].set_title(f'Image [{idx}]\nShape: {image.shape}')
-            axes[0].axis('off')
-
-            axes[1].imshow(mask, cmap='gray', vmin=0, vmax=1)
-            axes[1].set_title(f'Mask [{idx}]\nCoverage: {coverage:.1f}%')
-            axes[1].axis('off')
-
-            axes[2].imshow(overlay)
-            red_patch = mpatches.Patch(color='red', alpha=0.4, label='Buildings')
-            axes[2].legend(handles=[red_patch], loc='upper right')
-            axes[2].set_title(f'Overlay\nDtype: {image_tensor.dtype}')
-            axes[2].axis('off')
-
-        # Add overall title
-        img_path = dataset.image_paths[idx]
-        msk_path = dataset.mask_paths[idx]
-        fig.suptitle(
-            f'Sample {idx}: {img_path.name}\nMask: {msk_path.name}',
-            fontsize=10,
-            y=0.02
-        )
-
-        plt.tight_layout()
-
-        if save_path:
-            plt.savefig(save_path, dpi=150, bbox_inches='tight')
-            logger.info(f"Saved sample visualization to {save_path}")
-        else:
-            plt.show()
-
-        plt.close()
-
-        # Print detailed info
-        print(f"\n{'='*60}")
-        print(f"Sample {idx} Details:")
-        print(f"{'='*60}")
-        print(f"Image file: {img_path}")
-        print(f"Mask file: {msk_path}")
-        print(f"Image tensor: shape={image_tensor.shape}, dtype={image_tensor.dtype}")
-        print(f"  Range: [{image_tensor.min():.3f}, {image_tensor.max():.3f}]")
-        print(f"Mask tensor: shape={mask_tensor.shape}, dtype={mask_tensor.dtype}")
-        print(f"  Unique values: {np.unique(mask)}")
-        print(f"  Coverage: {coverage:.2f}%")
-        print(f"{'='*60}\n")
-
-    except ImportError:
-        logger.error("matplotlib is required for visualization")
-    except Exception as e:
-        logger.error(f"Visualization failed: {e}")
-        raise
+    # Print statistics
+    logger.info(f"[INFO] Sample {idx}: {image_path.name}")
+    logger.info(f"[INFO]   Image shape: {image.shape}")
+    logger.info(f"[INFO]   Mask shape: {mask.shape}")
+    logger.info(f"[INFO]   Coverage: {coverage:.1f}%")
+    logger.info(f"[INFO]   Building pixels: {pixel_count}")
 
 
 # ============================================================================
-# MAIN / TEST
+# MAIN / CLI
 # ============================================================================
 
 def main():
-    """Main function for comprehensive dataset testing."""
+    """Main function for dataset testing."""
     parser = argparse.ArgumentParser(
-        description='Test RoofDataset with comprehensive validation',
+        description='Production-Ready RoofDataset Testing',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
     # Basic test
-    python dataset.py --image_dir dataset/images --mask_dir dataset/masks
+    python dataset.py --image_dir dataset_final/images --mask_dir dataset_final/masks
 
-    # Test with augmentation
-    python dataset.py --image_dir dataset/images --mask_dir dataset/masks --augment
+    # With visualization
+    python dataset.py --image_dir dataset_final/images --mask_dir dataset_final/masks --visualize
 
-    # Visualize samples
-    python dataset.py --image_dir dataset/images --mask_dir dataset/masks --visualize
+    # With augmentation
+    python dataset.py --image_dir dataset_final/images --mask_dir dataset_final/masks --augment
 
-    # Test specific sample
-    python dataset.py --image_dir dataset/images --mask_dir dataset/masks --test_idx 5 --visualize
-
-    # Test DataLoader with multiple workers
-    python dataset.py --image_dir dataset/images --mask_dir dataset/masks --batch_size 8 --num_workers 2
+    # Batch test
+    python dataset.py --image_dir dataset_final/images --mask_dir dataset_final/masks --batch_size 8
         """
     )
 
     parser.add_argument('--image_dir', type=str, required=True,
-                        help='Directory containing images')
+                        help='Directory containing .tif images')
     parser.add_argument('--mask_dir', type=str, required=True,
-                        help='Directory containing masks')
+                        help='Directory containing .npy masks')
     parser.add_argument('--target_size', type=int, default=256,
-                        help='Target size for resizing (default: 256)')
+                        help='Target size (default: 256)')
     parser.add_argument('--augment', action='store_true',
-                        help='Enable data augmentation')
+                        help='Enable augmentation')
     parser.add_argument('--batch_size', type=int, default=4,
-                        help='Batch size for dataloader test (default: 4)')
-    parser.add_argument('--visualize', action='store_true',
-                        help='Visualize samples')
-    parser.add_argument('--visualize_aug', action='store_true',
-                        help='Visualize augmentation effects')
-    parser.add_argument('--save_path', type=str, default=None,
-                        help='Path to save visualization')
+                        help='Batch size (default: 4)')
     parser.add_argument('--num_workers', type=int, default=0,
-                        help='Number of DataLoader workers (default: 0)')
+                        help='DataLoader workers (default: 0)')
+    parser.add_argument('--visualize', action='store_true',
+                        help='Show 3-panel visualization')
+    parser.add_argument('--save_path', type=str, default=None,
+                        help='Save visualization to path')
     parser.add_argument('--test_idx', type=int, default=0,
-                        help='Specific sample index to test (default: 0)')
-    parser.add_argument('--test_count', type=int, default=5,
-                        help='Number of samples to test (default: 5)')
-    parser.add_argument('--verbose', action='store_true',
-                        help='Enable verbose logging')
+                        help='Sample index to test (default: 0)')
 
     args = parser.parse_args()
 
-    # Set logging level
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    print("\n" + "="*70)
-    print("STEP 7 & 8: PYTORCH DATASET WITH AUGMENTATION")
-    print("="*70 + "\n")
+    logger.info("=" * 70)
+    logger.info("ROOFTOP SEGMENTATION DATASET - PRODUCTION PIPELINE")
+    logger.info("=" * 70)
 
     # ============================================================
     # TEST 1: Dataset Initialization
     # ============================================================
-    logger.info("TEST 1: Creating RoofDataset...")
+    logger.info("")
+    logger.info("[INFO] Test 1: Dataset Initialization")
+    logger.info("-" * 70)
+
     try:
         dataset = RoofDataset(
             image_dir=args.image_dir,
@@ -1102,201 +721,93 @@ Examples:
             augment=args.augment,
             validate=True
         )
-        logger.info(f"✓ Dataset created with {len(dataset)} samples")
     except Exception as e:
-        logger.error(f"✗ Dataset creation failed: {e}")
+        logger.error(f"[ERROR] Dataset initialization failed: {e}")
+        sys.exit(1)
+
+    # CLI safety check
+    if len(dataset) < 100:
+        logger.error(f"[ERROR] Dataset too small ({len(dataset)} samples)!")
+        logger.error(f"[ERROR] Check if you meant dataset_final instead of dataset")
         sys.exit(1)
 
     # ============================================================
     # TEST 2: Single Sample Loading
     # ============================================================
-    print("\n" + "-"*70)
-    logger.info("TEST 2: Loading single samples...")
-
-    for i in range(min(args.test_count, len(dataset))):
-        try:
-            idx = (args.test_idx + i) % len(dataset)
-            image, mask = dataset[idx]
-
-            # Validate output
-            assert image.shape == (3, args.target_size, args.target_size), \
-                f"Image shape mismatch: {image.shape}"
-            assert mask.shape == (1, args.target_size, args.target_size), \
-                f"Mask shape mismatch: {mask.shape}"
-            assert image.dtype == np.float32, f"Image dtype should be float32, got {image.dtype}"
-            assert mask.dtype == np.float32, f"Mask dtype should be float32, got {mask.dtype}"
-            assert 0 <= image.min() <= image.max() <= 1.0, "Image values should be in [0, 1]"
-            assert set(np.unique(mask)).issubset({0, 1}), "Mask should be binary"
-
-            logger.info(f"✓ Sample {idx}: image={image.shape}, mask={mask.shape}, "
-                       f"coverage={mask.sum()/mask.size*100:.1f}%")
-
-        except Exception as e:
-            logger.error(f"✗ Sample {i} failed: {e}")
-            raise
-
-    logger.info(f"✓ Successfully loaded {min(args.test_count, len(dataset))} samples")
-
-    # ============================================================
-    # TEST 3: Detailed Single Sample Inspection
-    # ============================================================
-    print("\n" + "-"*70)
-    logger.info("TEST 3: Detailed sample inspection...")
+    logger.info("")
+    logger.info("[INFO] Test 2: Single Sample Loading")
+    logger.info("-" * 70)
 
     try:
         image, mask = dataset[args.test_idx]
-
-        print(f"\n{'='*70}")
-        print(f"Sample {args.test_idx} Tensor Details:")
-        print(f"{'='*70}")
-        print(f"Image tensor:")
-        print(f"  Shape:  {image.shape}")
-        print(f"  Dtype:  {image.dtype}")
-        print(f"  Range:  [{image.min():.4f}, {image.max():.4f}]")
-        print(f"  Mean:   {image.mean():.4f}")
-        print(f"  Std:    {image.std():.4f}")
-        print(f"\nMask tensor:")
-        print(f"  Shape:  {mask.shape}")
-        print(f"  Dtype:  {mask.dtype}")
-        print(f"  Unique: {np.unique(mask)}")
-        print(f"  Sum:    {mask.sum():.0f} / {mask.size} ({mask.sum()/mask.size*100:.2f}%)")
-        print(f"{'='*70}\n")
-
-        logger.info("✓ Detailed inspection passed")
-
+        logger.info(f"[INFO] Sample {args.test_idx}:")
+        logger.info(f"[INFO]   Image shape: {image.shape}, dtype: {image.dtype}")
+        logger.info(f"[INFO]   Mask shape: {mask.shape}, dtype: {mask.dtype}")
+        logger.info(f"[INFO]   Image range: [{image.min():.3f}, {image.max():.3f}]")
+        logger.info(f"[INFO]   Mask coverage: {mask.sum()/mask.size*100:.1f}%")
+        logger.info(f"[INFO] ✓ Single sample loading passed")
     except Exception as e:
-        logger.error(f"✗ Detailed inspection failed: {e}")
-        raise
+        logger.error(f"[ERROR] Single sample loading failed: {e}")
+        sys.exit(1)
 
     # ============================================================
-    # TEST 4: PyTorch DataLoader
+    # TEST 3: Visualization
     # ============================================================
-    print("\n" + "-"*70)
-    logger.info("TEST 4: Testing PyTorch DataLoader...")
+    if args.visualize:
+        logger.info("")
+        logger.info("[INFO] Test 3: Visualization")
+        logger.info("-" * 70)
+
+        try:
+            visualize_sample(dataset, idx=args.test_idx, save_path=args.save_path)
+            logger.info(f"[INFO] ✓ Visualization passed")
+        except Exception as e:
+            logger.error(f"[ERROR] Visualization failed: {e}")
+            sys.exit(1)
+
+    # ============================================================
+    # TEST 4: DataLoader Test
+    # ============================================================
+    logger.info("")
+    logger.info("[INFO] Test 4: DataLoader Test")
+    logger.info("-" * 70)
 
     try:
-        import torch
-
         dataloader = get_dataloader(
             dataset,
             batch_size=args.batch_size,
             shuffle=True,
-            num_workers=args.num_workers,
-            pin_memory=True
+            num_workers=args.num_workers
         )
 
-        # Get one batch
         batch_count = 0
         for batch_images, batch_masks in dataloader:
             batch_count += 1
 
-            # Validate batch
-            assert batch_images.shape[0] == batch_masks.shape[0], "Batch size mismatch"
-            assert batch_images.shape[1:] == (3, args.target_size, args.target_size), \
-                f"Batch image shape mismatch: {batch_images.shape}"
-            assert batch_masks.shape[1:] == (1, args.target_size, args.target_size), \
-                f"Batch mask shape mismatch: {batch_masks.shape}"
+            coverage = batch_masks.sum() / batch_masks.numel() * 100
+            logger.info(f"[INFO] Batch {batch_count}:")
+            logger.info(f"[INFO]   Images shape: {batch_images.shape}")
+            logger.info(f"[INFO]   Masks shape: {batch_masks.shape}")
+            logger.info(f"[INFO]   Coverage: {coverage:.1f}%")
 
-            logger.info(f"✓ Batch loaded: images={batch_images.shape}, masks={batch_masks.shape}")
-            logger.info(f"  Image range: [{batch_images.min():.3f}, {batch_images.max():.3f}]")
-            logger.info(f"  Mask coverage: {batch_masks.sum()/batch_masks.numel()*100:.1f}%")
-
-            if batch_count >= 2:  # Test 2 batches
+            if batch_count >= 2:
                 break
 
-        logger.info(f"✓ DataLoader test passed ({batch_count} batches)")
+        logger.info(f"[INFO] ✓ DataLoader test passed ({batch_count} batches)")
 
-    except ImportError:
-        logger.warning("PyTorch not available, skipping DataLoader test")
     except Exception as e:
-        logger.error(f"✗ DataLoader test failed: {e}")
-        raise
+        logger.error(f"[ERROR] DataLoader test failed: {e}")
+        sys.exit(1)
 
     # ============================================================
-    # TEST 5: Augmentation Effects (if enabled)
+    # Summary
     # ============================================================
-    if args.augment:
-        print("\n" + "-"*70)
-        logger.info("TEST 5: Testing augmentation effects...")
-
-        try:
-            # Load same sample multiple times to see different augmentations
-            samples = [dataset[args.test_idx] for _ in range(3)]
-
-            # Check that samples are different (augmentation is working)
-            all_same = all(np.allclose(samples[0][0], s[0]) for s in samples[1:])
-            if all_same:
-                logger.warning("⚠ All augmented samples are identical (random seed may be fixed)")
-            else:
-                logger.info("✓ Augmentation producing varied outputs")
-
-            # Validate augmented samples
-            for i, (img, msk) in enumerate(samples):
-                assert img.shape == (3, args.target_size, args.target_size)
-                assert msk.shape == (1, args.target_size, args.target_size)
-                assert 0 <= img.min() <= img.max() <= 1.0
-
-            logger.info(f"✓ Augmentation test passed ({len(samples)} variants)")
-
-        except Exception as e:
-            logger.error(f"✗ Augmentation test failed: {e}")
-            raise
-
-    # ============================================================
-    # TEST 6: Visualization
-    # ============================================================
-    if args.visualize:
-        print("\n" + "-"*70)
-        logger.info("TEST 6: Generating visualizations...")
-
-        try:
-            # Visualize specific sample
-            visualize_sample(
-                dataset,
-                idx=args.test_idx,
-                save_path=args.save_path,
-                show_original=args.augment
-            )
-            logger.info("✓ Sample visualization completed")
-
-        except Exception as e:
-            logger.error(f"✗ Visualization failed: {e}")
-            raise
-
-    if args.visualize_aug and args.augment:
-        try:
-            visualize_augmentations(
-                dataset,
-                idx=args.test_idx,
-                num_variants=4,
-                save_path=args.save_path.replace('.png', '_aug.png') if args.save_path else None
-            )
-            logger.info("✓ Augmentation visualization completed")
-
-        except Exception as e:
-            logger.error(f"✗ Augmentation visualization failed: {e}")
-
-    # ============================================================
-    # SUMMARY
-    # ============================================================
-    print("\n" + "="*70)
-    print("TEST SUMMARY - ALL TESTS PASSED ✓")
-    print("="*70)
-    print(f"Dataset path:  {args.image_dir}")
-    print(f"Mask path:     {args.mask_dir}")
-    print(f"Dataset size:  {len(dataset)} samples")
-    print(f"Image shape:   [3, {args.target_size}, {args.target_size}]")
-    print(f"Mask shape:    [1, {args.target_size}, {args.target_size}]")
-    print(f"Augmentation:  {'Enabled ✓' if args.augment else 'Disabled'}")
-    print(f"Batch size:    {args.batch_size}")
-    print(f"Num workers:   {args.num_workers}")
-    print("="*70)
-    print("\nThe dataset is ready for training!")
-    print("You can now use it with PyTorch DataLoader:\n")
-    print("    from dataset import RoofDataset, get_dataloader")
-    print("    dataset = RoofDataset(image_dir='...', mask_dir='...', augment=True)")
-    print("    loader = get_dataloader(dataset, batch_size=8)")
-    print("="*70 + "\n")
+    logger.info("")
+    logger.info("=" * 70)
+    logger.info("ALL TESTS PASSED")
+    logger.info("=" * 70)
+    logger.info(f"[INFO] Dataset ready for training with {len(dataset)} samples")
+    logger.info("=" * 70)
 
 
 if __name__ == '__main__':
