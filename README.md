@@ -54,7 +54,7 @@ Satellite Image (.tif) + Building Footprints (.geojson) → Binary Mask (.npy/.p
 ## Project Structure
 
 ```
-Solar_Sense/RoofTop_Detection/
+Rooftop-Detection-Area-Estimation/
 ├── README.md                      # This file
 ├── requirements.txt               # Python dependencies
 ├── match_dataset.py              # STEP 1: Image-Label Matcher
@@ -67,7 +67,7 @@ Solar_Sense/RoofTop_Detection/
 ├── loss.py                       # Combined loss: BCE + Dice + Focal
 ├── metrics.py                    # Evaluation metrics: IoU, Dice, Precision, Recall, F1
 ├── train.py                      # Training pipeline for the model
-├── area_utils.py                 # Solar area calculations and metrics
+├── area_utils.py                 # Area calculations and utilities
 ├── predict.py                    # STEP 9: Inference script for single image prediction
 ├── matched_pairs.json            # Generated: List of matched pairs
 ├── missing_labels.txt            # Generated: Images without labels
@@ -131,7 +131,7 @@ Solar_Sense/RoofTop_Detection/
 ### Step 1: Clone/Navigate to Project
 
 ```bash
-cd /Users/adityamensinkai/Desktop/Solar_Sense/RoofTop_Detection
+cd /path/to/Rooftop-Detection-Area-Estimation
 ```
 
 ### Step 2: Create Virtual Environment (Recommended)
@@ -1910,7 +1910,7 @@ If validation IoU plateaus, training will naturally converge with cosine anneali
 
 ### Script: `predict.py`
 
-Production-ready inference script for rooftop segmentation on a single satellite image. Loads a trained U-Net model, predicts the rooftop mask, and calculates solar potential metrics.
+Production-ready inference script for rooftop segmentation on a single satellite image. Loads a trained U-Net model, predicts the rooftop mask, and calculates area metrics.
 
 ### Features
 
@@ -1919,8 +1919,9 @@ Production-ready inference script for rooftop segmentation on a single satellite
 | **Single Image Inference** | Process one satellite image at a time |
 | **Model Loading** | Loads UNetResNet34 from checkpoint (.pth) |
 | **Proper Preprocessing** | Matches training: rasterio loading, 256x256 resize, [0,1] normalization |
-| **Solar Metrics** | Calculates area, capacity, energy, CO₂ offset |
-| **Visualization** | Saves mask and side-by-side visualization |
+| **Area Metrics** | Calculates roof area in m² from segmentation mask |
+| **Post-Processing** | Morphological cleaning, connected component filtering |
+| **Visualization** | Saves mask, side-by-side visualization, and debug probability heatmap |
 | **CLI Support** | Full command-line interface with arguments |
 
 ### Prerequisites
@@ -1947,8 +1948,9 @@ python3 predict.py --image_path sample.tif
 python3 predict.py \
     --image_path sample.tif \
     --model_path runs/solarsense/best_model.pth \
-    --gsd 0.5 \
-    --state Karnataka
+    --gsd 0.3 \
+    --threshold 0.4 \
+    --min_area 100
 ```
 
 ### Command-Line Arguments
@@ -1957,29 +1959,34 @@ python3 predict.py \
 |----------|---------|-------------|
 | `--image_path` | (required) | Path to input satellite image |
 | `--model_path` | `runs/solarsense/best_model.pth` | Path to model checkpoint |
-| `--gsd` | `0.5` | Ground Sampling Distance (meters/pixel) |
-| `--state` | `Karnataka` | Indian state for solar calculations |
+| `--gsd` | `0.3` | Ground Sampling Distance (meters/pixel) |
+| `--zoom` | `None` | Google Maps zoom level (18 or 19, optional) |
+| `--threshold` | `0.4` | Confidence threshold for binary mask |
+| `--min_area` | `100` | Minimum component area in pixels |
+| `--kernel_size` | `3` | Morphological kernel size |
+| `--top_k` | `None` | Keep only top-K largest components |
+| `--smooth` | `False` | Apply Gaussian smoothing before threshold |
 | `--output_dir` | `outputs` | Directory for output files |
 | `--device` | auto-detect | Device to use (cuda/cpu) |
 
 ### Example Output
 
 ```
-========================================
+==================================================
+===== POST-PROCESSING STATS =====
+==================================================
+Threshold used:        0.40
+Roof pixels:           18.45%
+Components before:     45
+Components after:      12 (removed 33)
+
+==================================================
 ===== PREDICTION RESULTS =====
-========================================
+==================================================
 Roof pixels:     12,345
 Total area:      3,086.2 m²
 Usable area:     2,314.7 m²
-
-========================================
-===== SOLAR ESTIMATION =====
-========================================
-Capacity:        356.11 kW
-Annual energy:   498,557 kWh
-System cost:     ₹19,585,923
-CO₂ saved:       356,967 kg/year
-========================================
+==================================================
 ```
 
 ### Output Files
@@ -1988,41 +1995,24 @@ CO₂ saved:       356,967 kg/year
 |------|-------------|
 | `outputs/mask.png` | Binary segmentation mask (grayscale) |
 | `outputs/viz.png` | Side-by-side visualization: original, mask, overlay |
+| `outputs/debug_prob.png` | Debug view: original, probability heatmap, cleaned mask |
 
-### Solar Calculations
+### Area Calculation
 
 The script uses `area_utils.py` for calculations:
 
-1. **Area Calculation** (`pixels_to_area()`):
-   - Counts roof pixels
-   - Converts to m² using GSD
-   - Applies 75% usable factor for solar panels
-
-2. **Solar Metrics** (`area_to_solar_metrics()`):
-   - State-specific GHI (Global Horizontal Irradiance)
-   - System capacity based on area
-   - Annual energy generation
-   - MNRE benchmark system cost
-   - CO₂ offset calculations
-
-### State Options
-
-Available states for `--state` argument:
-
-| State | GHI (kWh/m²/day) |
-|-------|------------------|
-| Karnataka | 5.3 |
-| Maharashtra | 5.4 |
-| Rajasthan | 6.2 |
-| Tamil Nadu | 5.5 |
-| Gujarat | 5.8 |
-| ... | ... |
+1. **Pixel Counting**: Counts roof pixels from binary mask
+2. **GSD Resolution**: Uses Ground Sampling Distance (meters/pixel) via:
+   - Explicit `--gsd` argument
+   - `--zoom` level mapping (zoom 18 → 0.3m, zoom 19 → 0.15m)
+   - Default fallback (0.3m for SpaceNet)
+3. **Area Formula**: `area_m² = pixels × (gsd)²`
 
 ### Python API Usage
 
 ```python
-from predict import load_model, preprocess, predict, postprocess
-from area_utils import pixels_to_area, area_to_solar_metrics
+from predict import load_model, preprocess, predict
+from area_utils import pixels_to_area
 import torch
 
 # Setup
@@ -2034,16 +2024,19 @@ model = load_model("runs/solarsense/best_model.pth", device)
 # Preprocess
 image_tensor, original = preprocess("sample.tif", device)
 
-# Predict
-pred_mask = predict(model, image_tensor)
-binary_mask = postprocess(pred_mask)
+# Predict (returns probabilities)
+probs = predict(model, image_tensor)
 
-# Calculate metrics
-area_info = pixels_to_area(binary_mask, gsd=0.5)
-solar_info = area_to_solar_metrics(area_info["usable_area_m2"], state="Karnataka")
+# Apply threshold to get binary mask
+import numpy as np
+binary_mask = (probs.cpu().numpy() > 0.4).astype(np.uint8)
 
+# Calculate area
+area_info = pixels_to_area(binary_mask, gsd=0.3)
+
+print(f"Roof pixels: {area_info['roof_pixels']}")
+print(f"Total area: {area_info['total_roof_area_m2']:.1f} m²")
 print(f"Usable area: {area_info['usable_area_m2']:.1f} m²")
-print(f"Capacity: {solar_info['system_kw_capacity']:.2f} kW")
 ```
 
 ---
@@ -2181,7 +2174,7 @@ print(f"Capacity: {solar_info['system_kw_capacity']:.2f} kW")
 | **5** | `build_dataset.py` | `matched_pairs.json` + masks | `dataset_final/` | Build clean training structure |
 | **6** | `dataset.py` | `dataset_final/images/` + `dataset_final/masks/` | PyTorch DataLoader | Preprocessing + Augmentation for model training |
 | **7** | `train.py` | Dataset + Model | `best_model.pth` | Train U-Net model |
-| **8** | `predict.py` | Image + Model | Mask + Solar metrics | Inference on new images |
+| **8** | `predict.py` | Image + Model | Mask + Area metrics | Inference on new images |
 
 **Note**: Steps 7-8 use the model training and inference scripts, while the numbered sections below document the dataset preparation (Steps 6-8) before training.
 
