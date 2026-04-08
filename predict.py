@@ -1,18 +1,18 @@
 """
 Rooftop Segmentation Inference Script
 
-Predicts rooftop segmentation mask from a single satellite image,
-calculates area metrics, and estimates solar potential.
+Predicts rooftop segmentation mask from a single satellite image
+and calculates area metrics.
 
 Usage:
-    python predict.py --image_path sample.tif --gsd 0.5 --state Karnataka
+    python predict.py --image_path sample.tif --gsd 0.5
     python predict.py --image_path sample.tif --threshold 0.4 --min_area 100 --top_k 20
 
 Output:
     - outputs/mask.png         : Binary segmentation mask
     - outputs/viz.png          : Side-by-side visualization
     - outputs/debug_prob.png   : Debug view (original, probability, cleaned mask)
-    - Console                  : Area and solar metrics with post-processing stats
+    - Console                  : Area metrics with post-processing stats
 """
 
 import argparse
@@ -28,7 +28,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from area_utils import area_to_solar_metrics, pixels_to_area
+from area_utils import pixels_to_area
 from model import UNetResNet34
 
 # Configure logging
@@ -409,7 +409,6 @@ def save_outputs(
 
 def print_results(
     area_info: dict,
-    solar_info: dict,
     threshold: float,
     roof_pixels_pct: float,
     components_before: int,
@@ -420,16 +419,11 @@ def print_results(
 
     Args:
         area_info: Output from pixels_to_area()
-        solar_info: Output from area_to_solar_metrics()
         threshold: Threshold value used
         roof_pixels_pct: Percentage of pixels predicted as roof
         components_before: Number of components before filtering
         components_after: Number of components after filtering
     """
-    # Format currency
-    cost_inr = solar_info["estimated_system_cost_inr"]
-    cost_formatted = f"₹{cost_inr:,.0f}"
-
     print("\n" + "=" * 50)
     print("===== POST-PROCESSING STATS =====")
     print("=" * 50)
@@ -444,15 +438,50 @@ def print_results(
     print(f"Roof pixels:     {area_info['roof_pixels']:,.0f}")
     print(f"Total area:      {area_info['total_roof_area_m2']:,.1f} m²")
     print(f"Usable area:     {area_info['usable_area_m2']:,.1f} m²")
-    print()
-    print("=" * 50)
-    print("===== SOLAR ESTIMATION =====")
-    print("=" * 50)
-    print(f"Capacity:        {solar_info['system_kw_capacity']:.2f} kW")
-    print(f"Annual energy:   {solar_info['annual_kwh']:,.0f} kWh")
-    print(f"System cost:     {cost_formatted}")
-    print(f"CO₂ saved:       {solar_info['co2_offset_kg_per_year']:,.0f} kg/year")
     print("=" * 50 + "\n")
+
+
+def resolve_gsd(gsd_arg: Optional[float], zoom_arg: Optional[int]) -> float:
+    """
+    Resolve GSD value from explicit argument or zoom level.
+
+    Priority:
+    1. Explicit --gsd value (warns if --zoom also provided)
+    2. --zoom level mapping (18 -> 0.3, 19 -> 0.15)
+    3. Default fallback (0.3 for SpaceNet dataset compatibility)
+
+    Args:
+        gsd_arg: Explicit GSD value from --gsd
+        zoom_arg: Zoom level from --zoom
+
+    Returns:
+        Resolved GSD in meters per pixel
+
+    Raises:
+        ValueError: If gsd <= 0 or unsupported zoom level
+    """
+    # Priority 1: Explicit GSD provided
+    if gsd_arg is not None:
+        if gsd_arg <= 0:
+            raise ValueError(f"GSD must be positive, got: {gsd_arg}")
+        if zoom_arg is not None:
+            logger.warning(f"Both --gsd ({gsd_arg}) and --zoom ({zoom_arg}) provided. Using --gsd.")
+        return float(gsd_arg)
+
+    # Priority 2: Zoom level mapping
+    if zoom_arg is not None:
+        zoom_to_gsd = {
+            19: 0.15,  # Google Maps zoom 19 (~6 inch resolution)
+            18: 0.30,  # Google Maps zoom 18 (~1 foot resolution)
+        }
+        if zoom_arg not in zoom_to_gsd:
+            supported = list(zoom_to_gsd.keys())
+            raise ValueError(f"Unsupported zoom level: {zoom_arg}. Supported: {supported}")
+        return zoom_to_gsd[zoom_arg]
+
+    # Priority 3: Default fallback for SpaceNet dataset
+    logger.info("No --gsd or --zoom provided. Using default GSD: 0.3 m/px (SpaceNet)")
+    return 0.3
 
 
 def parse_args() -> argparse.Namespace:
@@ -463,7 +492,7 @@ def parse_args() -> argparse.Namespace:
         epilog="""
 Examples:
   python predict.py --image_path sample.tif
-  python predict.py --image_path sample.tif --gsd 0.3 --state Maharashtra
+  python predict.py --image_path sample.tif --gsd 0.3
   python predict.py --image_path sample.tif --threshold 0.4 --min_area 100 --top_k 20
   python predict.py --image_path sample.tif --smooth --threshold 0.35
         """,
@@ -486,15 +515,15 @@ Examples:
     parser.add_argument(
         "--gsd",
         type=float,
-        default=0.5,
-        help="Ground Sampling Distance in meters per pixel (default: 0.5)",
+        default=None,
+        help="Ground Sampling Distance (meters per pixel). If not provided, use zoom-based default.",
     )
 
     parser.add_argument(
-        "--state",
-        type=str,
-        default="Karnataka",
-        help="Indian state for solar calculations (default: Karnataka)",
+        "--zoom",
+        type=int,
+        default=None,
+        help="Zoom level if using Google Maps images (e.g., 18 or 19)",
     )
 
     parser.add_argument(
@@ -561,6 +590,10 @@ def main() -> int:
     logger.info(f"Using device: {device}")
 
     try:
+        # Resolve GSD value from arguments
+        gsd = resolve_gsd(args.gsd, args.zoom)
+        logger.info(f"Using GSD: {gsd} meters/pixel")
+        logger.info(f"Pixel area: {gsd * gsd:.4f} m²")
         # Load model
         model = load_model(args.model_path, device)
 
@@ -603,11 +636,7 @@ def main() -> int:
 
         # Calculate area
         logger.info("Calculating area metrics...")
-        area_info = pixels_to_area(binary_mask, gsd=args.gsd)
-
-        # Calculate solar metrics
-        logger.info(f"Calculating solar metrics for {args.state}...")
-        solar_info = area_to_solar_metrics(area_info["usable_area_m2"], state=args.state)
+        area_info = pixels_to_area(binary_mask, gsd=gsd)
 
         # Save outputs
         logger.info(f"Saving outputs to {args.output_dir}/")
@@ -619,7 +648,6 @@ def main() -> int:
         # Print results with post-processing stats
         print_results(
             area_info,
-            solar_info,
             args.threshold,
             roof_pixels_pct,
             components_before,
