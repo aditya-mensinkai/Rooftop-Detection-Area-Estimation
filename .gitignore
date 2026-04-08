@@ -12,6 +12,12 @@ ENV/
 
 # Data and Logs
 SN2_Vegas/
+dataset/
+dataset_final/
+runs/
+sample_imgs/
+validation_viz/
+outputs/
 mask_generation.log
 matched_pairs.json
 missing_images.txt

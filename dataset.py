@@ -355,7 +355,11 @@ class RoofDataset:
         target_size: Union[int, Tuple[int, int]] = 256,
         augment: bool = False,
         transform: Optional[Callable] = None,
-        validate: bool = True
+        validate: bool = True,
+        file_stems: Optional[List[str]] = None,
+        gsd: Optional[float] = None,
+        filter_empty: bool = True,
+        keep_empty_ratio: float = 0.2,
     ):
         """Initialize dataset with strict file matching."""
         self.image_dir = Path(image_dir)
@@ -363,6 +367,10 @@ class RoofDataset:
         self.target_size = target_size
         self.transform = transform
         self.augment = Augmentation() if augment else None
+        self.file_stems = file_stems
+        self.gsd = gsd
+        self.filter_empty = filter_empty
+        self.keep_empty_ratio = keep_empty_ratio
 
         # Validate directories exist
         if not self.image_dir.exists():
@@ -404,8 +412,49 @@ class RoofDataset:
         # Find intersection (strict matching)
         valid_stems = set(image_files.keys()) & set(mask_files.keys())
 
+        # Filter by file_stems if provided (for train/val split)
+        if self.file_stems is not None:
+            requested_stems = set(self.file_stems)
+            valid_stems = valid_stems & requested_stems
+            # Warn about requested stems that don't exist
+            missing = requested_stems - valid_stems
+            if missing:
+                logger.warning(f"[WARNING] {len(missing)} requested file stems not found in dataset")
+
         # Build sorted pairs list
         pairs = [(image_files[stem], mask_files[stem]) for stem in sorted(valid_stems)]
+
+        # Filter out empty masks if requested (but keep some for realistic training)
+        if self.filter_empty:
+            import random
+
+            non_empty_pairs = []
+            empty_pairs = []
+
+            for img_path, mask_path in pairs:
+                try:
+                    mask = np.load(mask_path)
+                    if mask.sum() > 0:
+                        non_empty_pairs.append((img_path, mask_path))
+                    else:
+                        empty_pairs.append((img_path, mask_path))
+                except Exception:
+                    # If we can't load the mask, keep it (will fail later with better error)
+                    non_empty_pairs.append((img_path, mask_path))
+
+            # Keep all non-empty + sample of empty masks
+            n_empty_total = len(empty_pairs)
+            n_empty_keep = int(n_empty_total * self.keep_empty_ratio)
+            if n_empty_keep > 0 and empty_pairs:
+                random.shuffle(empty_pairs)
+                kept_empty = empty_pairs[:n_empty_keep]
+            else:
+                kept_empty = []
+
+            pairs = non_empty_pairs + kept_empty
+
+            if n_empty_total > 0:
+                logger.info(f"[INFO] Dataset: {len(non_empty_pairs)} non-empty + {len(kept_empty)}/{n_empty_total} empty ({self.keep_empty_ratio*100:.0f}% kept) = {len(pairs)} total")
 
         # Store counts for summary
         self._total_images = len(image_files)
@@ -812,3 +861,39 @@ Examples:
 
 if __name__ == '__main__':
     main()
+
+
+# -----------------------------------------------------------------------------
+# Dataset Splitting Utility
+# -----------------------------------------------------------------------------
+
+def split_dataset(
+    image_dir: Union[str, Path],
+    val_split: float = 0.15,
+    seed: int = 42,
+) -> Tuple[List[str], List[str]]:
+    """
+    Randomly split file stems into train and val lists.
+
+    Args:
+        image_dir: Directory with .tif images.
+        val_split: Fraction to use for validation (0 < val_split < 1).
+        seed: Random seed for reproducibility.
+
+    Returns:
+        (train_stems, val_stems) lists of file stems.
+    """
+    import random
+
+    stems = sorted(p.stem for p in Path(image_dir).glob("*.tif"))
+    rng = random.Random(seed)
+    rng.shuffle(stems)
+
+    n_val = max(1, int(len(stems) * val_split))
+    val_stems = stems[:n_val]
+    train_stems = stems[n_val:]
+    return train_stems, val_stems
+
+
+# Alias for backward compatibility with train.py
+RooftopDataset = RoofDataset

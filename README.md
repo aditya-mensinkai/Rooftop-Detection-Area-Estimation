@@ -21,6 +21,8 @@ A production-ready Python pipeline for converting SpaceNet satellite imagery and
 - [STEP 6: Production-Ready PyTorch Dataset](#step-6-production-ready-pytorch-dataset)
 - [STEP 7: PyTorch Dataset Details](#step-7-pytorch-dataset-production)
 - [STEP 8: Data Augmentation](#step-8-data-augmentation)
+- [STEP 9: Training](#step-9-training)
+- [STEP 10: Inference with Trained Model](#step-10-inference)
 - [Pipeline Architecture](#pipeline-architecture)
 - [Troubleshooting](#troubleshooting)
 - [Performance Tips](#performance-tips)
@@ -61,6 +63,12 @@ Solar_Sense/RoofTop_Detection/
 ├── visualize_masks.py            # STEP 4: Visualize and validate masks (CRITICAL DEBUG)
 ├── build_dataset.py              # STEP 5: Build final dataset structure
 ├── dataset.py                    # STEP 7-8: PyTorch Dataset + Data Augmentation
+├── model.py                      # U-Net with ResNet34 encoder for segmentation
+├── loss.py                       # Combined loss: BCE + Dice + Focal
+├── metrics.py                    # Evaluation metrics: IoU, Dice, Precision, Recall, F1
+├── train.py                      # Training pipeline for the model
+├── area_utils.py                 # Solar area calculations and metrics
+├── predict.py                    # STEP 9: Inference script for single image prediction
 ├── matched_pairs.json            # Generated: List of matched pairs
 ├── missing_labels.txt            # Generated: Images without labels
 ├── missing_images.txt            # Generated: Labels without images
@@ -80,6 +88,10 @@ Solar_Sense/RoofTop_Detection/
 │   └── masks/                    # Training masks (.npy)
 │       ├── img1.npy
 │       └── ...
+├── runs/                         # Training outputs
+│   └── solarsense/               # Experiment runs
+│       ├── best_model.pth        # Best trained model
+│       └── checkpoint_*.pth      # Training checkpoints
 └── SN2_Vegas/                    # SpaceNet Dataset
     ├── PS-RGB/                   # Satellite images (.tif)
     │   ├── SN2_buildings_train_AOI_2_Vegas_PS-RGB_img1.tif
@@ -1727,8 +1739,312 @@ python3 dataset.py --image_dir dataset_final/images --mask_dir dataset_final/mas
 Shows side-by-side comparison:
 - Original image
 - Original mask
-- Augmented image  
+- Augmented image
 - Augmented mask
+
+---
+
+## STEP 9: Training
+
+### Script: `train.py`
+
+Complete training pipeline for U-Net with ResNet34 encoder. Implements a two-phase training strategy with frozen encoder warmup followed by full fine-tuning.
+
+### Features
+
+| Feature | Description |
+|---------|-------------|
+| **Two-Phase Training** | Phase 1: Freeze encoder (decoder warmup). Phase 2: Unfreeze encoder (full fine-tune) |
+| **Combined Loss** | BCE + Dice + Focal loss for handling class imbalance |
+| **Metrics Tracking** | IoU, Dice, Pixel Accuracy, Precision, Recall, F1 |
+| **Mixed Precision** | Automatic mixed precision (AMP) when CUDA available |
+| **Checkpointing** | Saves best model (by val IoU) and latest checkpoint |
+| **Visualization** | Periodic grid visualizations of predictions |
+| **CSV Logging** | Per-epoch training metrics log |
+
+### Training Strategy
+
+```
+Phase 1 (Epochs 1-10):  Encoder frozen, decoder trains at lr=1e-3
+Phase 2 (Epochs 11-40): Encoder unfrozen, differential LR:
+                         - Decoder: lr=1e-3
+                         - Encoder: lr=1e-4 (10x lower)
+```
+
+### Prerequisites
+
+Ensure you have the final dataset structure:
+
+```
+dataset_final/
+├── images/          # Training images (.tif)
+└── masks/         # Training masks (.npy)
+```
+
+### Usage
+
+#### Basic Training
+
+```bash
+python3 train.py --image_dir dataset_final/images --mask_dir dataset_final/masks
+```
+
+#### Custom Parameters
+
+```bash
+python3 train.py \
+    --image_dir dataset_final/images \
+    --mask_dir dataset_final/masks \
+    --epochs 40 \
+    --freeze_epochs 10 \
+    --batch_size 8 \
+    --lr_decoder 1e-3 \
+    --lr_encoder 1e-4 \
+    --dropout 0.3 \
+    --output_dir runs/solarsense
+```
+
+#### Resume from Checkpoint
+
+```bash
+python3 train.py \
+    --image_dir dataset_final/images \
+    --mask_dir dataset_final/masks \
+    --resume runs/solarsense/last_model.pth
+```
+
+### Command-Line Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--image_dir` | `dataset_final/images` | Path to training images |
+| `--mask_dir` | `dataset_final/masks` | Path to training masks |
+| `--output_dir` | `runs/solarsense` | Output directory for checkpoints |
+| `--epochs` | `40` | Total training epochs |
+| `--freeze_epochs` | `10` | Epochs to freeze encoder (Phase 1) |
+| `--batch_size` | `8` | Batch size for training |
+| `--img_size` | `256` | Image size (H×W) |
+| `--lr_decoder` | `1e-3` | Decoder learning rate |
+| `--lr_encoder` | `1e-4` | Encoder learning rate (Phase 2) |
+| `--val_split` | `0.15` | Validation set fraction |
+| `--dropout` | `0.3` | Dropout probability |
+| `--workers` | `4` | DataLoader worker processes |
+| `--filter_empty` | `True` | Filter empty masks (no buildings) |
+| `--viz_every` | `5` | Save visualization every N epochs |
+| `--resume` | `None` | Path to checkpoint to resume from |
+
+### Output Files
+
+| File | Description |
+|------|-------------|
+| `best_model.pth` | Best model checkpoint (highest val IoU) |
+| `last_model.pth` | Most recent checkpoint |
+| `train_log.csv` | Per-epoch metrics (loss, IoU, Dice, etc.) |
+| `viz/epoch_*.png` | Prediction visualization grids |
+
+### Example Output
+
+```
+[1/5] Building datasets …
+  Train: 3272 | Val: 578
+
+[2/5] Building model …
+
+[3/5] Configuring optimiser …
+  Phase 1: encoder frozen for 10 epochs
+
+[4/5] Training for 40 epochs …
+
+=================================================================
+Epoch   1/40  Train loss: 0.8234  Val loss: 0.7123  Val IoU: 0.3421  Val Dice: 0.4856  LR: 1.00e-03  [45.2s]
+Epoch   2/40  Train loss: 0.6543  Val loss: 0.6234  Val IoU: 0.4123  Val Dice: 0.5621  LR: 9.80e-04  [44.8s]
+...
+Epoch  10/40  Train loss: 0.3456  Val loss: 0.4123  Val IoU: 0.6234  Val Dice: 0.7456  LR: 6.50e-04  [44.1s]
+
+  ✦ Phase 2: encoder unfrozen (decoder LR=0.001, encoder LR=0.0001)
+
+Epoch  11/40  Train loss: 0.3123  Val loss: 0.3891  Val IoU: 0.6543  Val Dice: 0.7823  LR: 1.00e-03  [52.3s]
+...
+Epoch  40/40  Train loss: 0.1234  Val loss: 0.2345  Val IoU: 0.8234  Val Dice: 0.8934  LR: 1.00e-06  [51.8s]
+  ★ New best val IoU: 0.8234 → best_model.pth
+
+=================================================================
+[5/5] Training complete.
+  Best val IoU : 0.8234
+  Best model   : runs/solarsense/best_model.pth
+  Training log : runs/solarsense/train_log.csv
+  Viz grids    : runs/solarsense/viz/
+```
+
+### Training Tips
+
+**1. Start with Default Settings**
+```bash
+python3 train.py
+```
+
+**2. Monitor Training**
+```bash
+# Watch training log
+watch -n 5 "cat runs/solarsense/train_log.csv | tail -10"
+
+# Check latest visualization
+ls -la runs/solarsense/viz/
+```
+
+**3. Adjust for Hardware**
+```bash
+# For limited GPU memory
+python3 train.py --batch_size 4 --img_size 256
+
+# For CPU training (slower)
+python3 train.py --batch_size 4 --workers 0
+```
+
+**4. Early Stopping**
+If validation IoU plateaus, training will naturally converge with cosine annealing LR schedule.
+
+---
+
+## STEP 10: Inference with Trained Model
+
+### Script: `predict.py`
+
+Production-ready inference script for rooftop segmentation on a single satellite image. Loads a trained U-Net model, predicts the rooftop mask, and calculates solar potential metrics.
+
+### Features
+
+| Feature | Description |
+|---------|-------------|
+| **Single Image Inference** | Process one satellite image at a time |
+| **Model Loading** | Loads UNetResNet34 from checkpoint (.pth) |
+| **Proper Preprocessing** | Matches training: rasterio loading, 256x256 resize, [0,1] normalization |
+| **Solar Metrics** | Calculates area, capacity, energy, CO₂ offset |
+| **Visualization** | Saves mask and side-by-side visualization |
+| **CLI Support** | Full command-line interface with arguments |
+
+### Prerequisites
+
+Ensure you have a trained model checkpoint:
+
+```
+runs/
+└── solarsense/
+    └── best_model.pth          # Trained model weights
+```
+
+### Usage
+
+#### Basic Inference
+
+```bash
+python3 predict.py --image_path sample.tif
+```
+
+#### Custom Parameters
+
+```bash
+python3 predict.py \
+    --image_path sample.tif \
+    --model_path runs/solarsense/best_model.pth \
+    --gsd 0.5 \
+    --state Karnataka
+```
+
+### Command-Line Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--image_path` | (required) | Path to input satellite image |
+| `--model_path` | `runs/solarsense/best_model.pth` | Path to model checkpoint |
+| `--gsd` | `0.5` | Ground Sampling Distance (meters/pixel) |
+| `--state` | `Karnataka` | Indian state for solar calculations |
+| `--output_dir` | `outputs` | Directory for output files |
+| `--device` | auto-detect | Device to use (cuda/cpu) |
+
+### Example Output
+
+```
+========================================
+===== PREDICTION RESULTS =====
+========================================
+Roof pixels:     12,345
+Total area:      3,086.2 m²
+Usable area:     2,314.7 m²
+
+========================================
+===== SOLAR ESTIMATION =====
+========================================
+Capacity:        356.11 kW
+Annual energy:   498,557 kWh
+System cost:     ₹19,585,923
+CO₂ saved:       356,967 kg/year
+========================================
+```
+
+### Output Files
+
+| File | Description |
+|------|-------------|
+| `outputs/mask.png` | Binary segmentation mask (grayscale) |
+| `outputs/viz.png` | Side-by-side visualization: original, mask, overlay |
+
+### Solar Calculations
+
+The script uses `area_utils.py` for calculations:
+
+1. **Area Calculation** (`pixels_to_area()`):
+   - Counts roof pixels
+   - Converts to m² using GSD
+   - Applies 75% usable factor for solar panels
+
+2. **Solar Metrics** (`area_to_solar_metrics()`):
+   - State-specific GHI (Global Horizontal Irradiance)
+   - System capacity based on area
+   - Annual energy generation
+   - MNRE benchmark system cost
+   - CO₂ offset calculations
+
+### State Options
+
+Available states for `--state` argument:
+
+| State | GHI (kWh/m²/day) |
+|-------|------------------|
+| Karnataka | 5.3 |
+| Maharashtra | 5.4 |
+| Rajasthan | 6.2 |
+| Tamil Nadu | 5.5 |
+| Gujarat | 5.8 |
+| ... | ... |
+
+### Python API Usage
+
+```python
+from predict import load_model, preprocess, predict, postprocess
+from area_utils import pixels_to_area, area_to_solar_metrics
+import torch
+
+# Setup
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Load model
+model = load_model("runs/solarsense/best_model.pth", device)
+
+# Preprocess
+image_tensor, original = preprocess("sample.tif", device)
+
+# Predict
+pred_mask = predict(model, image_tensor)
+binary_mask = postprocess(pred_mask)
+
+# Calculate metrics
+area_info = pixels_to_area(binary_mask, gsd=0.5)
+solar_info = area_to_solar_metrics(area_info["usable_area_m2"], state="Karnataka")
+
+print(f"Usable area: {area_info['usable_area_m2']:.1f} m²")
+print(f"Capacity: {solar_info['system_kw_capacity']:.2f} kW")
+```
 
 ---
 
@@ -1826,6 +2142,31 @@ Shows side-by-side comparison:
                         │         ▼    ▼  │
                         │       Mask Loss │
                         │                 │
+                        └────────┬────────┘
+                                 │
+                                 ▼
+                        ┌─────────────────┐
+                        │   best_model    │
+                        │     .pth        │
+                        └────────┬────────┘
+                                 │
+                                 ▼
+                        ┌─────────────────┐
+                        │    predict      │
+                        │       .py       │
+                        │   (STEP 9)      │
+                        ├─────────────────┤
+                        │  1. Load model  │
+                        │  2. Predict     │
+                        │  3. Calculate   │
+                        │  4. Visualize   │
+                        └─────────────────┘
+                                 │
+                                 ▼
+                        ┌─────────────────┐
+                        │    outputs/     │
+                        │  ├─ mask.png    │
+                        │  └─ viz.png     │
                         └─────────────────┘
 ```
 
@@ -1839,6 +2180,10 @@ Shows side-by-side comparison:
 | **4** | `visualize_masks.py` | `dataset/masks/` | Validation report | Verify alignment before training |
 | **5** | `build_dataset.py` | `matched_pairs.json` + masks | `dataset_final/` | Build clean training structure |
 | **6** | `dataset.py` | `dataset_final/images/` + `dataset_final/masks/` | PyTorch DataLoader | Preprocessing + Augmentation for model training |
+| **7** | `train.py` | Dataset + Model | `best_model.pth` | Train U-Net model |
+| **8** | `predict.py` | Image + Model | Mask + Solar metrics | Inference on new images |
+
+**Note**: Steps 7-8 use the model training and inference scripts, while the numbered sections below document the dataset preparation (Steps 6-8) before training.
 
 ---
 
@@ -1931,7 +2276,7 @@ python3 generate_masks_batch.py --num_workers 1
 
 **Cause**: Too many workers causing memory exhaustion.
 
-**Solution**: 
+**Solution**:
 ```bash
 # Reduce workers and add resize
 python3 generate_masks_batch.py --num_workers 2 --resize 256
@@ -1939,6 +2284,53 @@ python3 generate_masks_batch.py --num_workers 2 --resize 256
 # Monitor memory
 python3 generate_masks_batch.py &
 watch -n 1 "ps aux | grep generate_masks"
+```
+
+---
+
+### Issue: Prediction outputs all zeros / Max probability ~1e-17 / No rooftops detected
+
+**Symptoms**:
+- Model prediction gives `Max probability: 4.4e-05` (near zero)
+- `Roof pixels: 0` in output
+- Input debug shows `Input max: 0.0156` (should be ~1.0)
+
+**Root Cause**: Preprocessing mismatch between training and prediction.
+
+**Explanation**:
+The prediction pipeline must use **EXACTLY** the same preprocessing as training:
+
+| Pipeline | Image Loader | Scaling | Normalization |
+|----------|--------------|---------|---------------|
+| **Training** (`dataset.py`) | `rasterio` | Auto-detects 16-bit TIFF, scales to uint8 | `/ 255.0` → range [0,1] |
+| **Prediction** (old `predict.py`) | `cv2.imread()` | Broken for 16-bit TIFF | `/ 255.0` → range [0, 0.015] ❌ |
+
+**The Problem**: SpaceNet TIFF images are 16-bit (0-65535). OpenCV loads them incorrectly, causing input values to be 64x darker than expected.
+
+**Solution**: Ensure `predict.py` uses `rasterio` (same as training):
+
+```python
+# ✅ CORRECT - Use rasterio (matches training)
+import rasterio
+with rasterio.open(image_path) as src:
+    image = np.dstack([src.read(i) for i in range(1, 4)])
+    if image.max() > 255:
+        image = (image / image.max() * 255).astype(np.uint8)
+
+# ❌ WRONG - OpenCV doesn't handle 16-bit TIFF correctly
+image = cv2.imread(image_path)  # Don't use for 16-bit TIFFs!
+```
+
+**Verification**:
+After fix, you should see:
+```python
+Input min: 0.0
+Input max: ~1.0          # ✅ (was 0.0156)
+Max probability: 0.3-0.9  # ✅ (was 4.4e-05)
+Roof pixels: > 0          # ✅ (was 0)
+```
+
+**Golden Rule**: Prediction must use EXACTLY the same image loading and preprocessing as training.
 ```
 
 ### Issue: Processing is slow even with multiple workers
