@@ -6,11 +6,13 @@ calculates area metrics, and estimates solar potential.
 
 Usage:
     python predict.py --image_path sample.tif --gsd 0.5 --state Karnataka
+    python predict.py --image_path sample.tif --threshold 0.4 --min_area 100 --top_k 20
 
 Output:
-    - outputs/mask.png    : Binary segmentation mask
-    - outputs/viz.png     : Side-by-side visualization
-    - Console             : Area and solar metrics
+    - outputs/mask.png         : Binary segmentation mask
+    - outputs/viz.png          : Side-by-side visualization
+    - outputs/debug_prob.png   : Debug view (original, probability, cleaned mask)
+    - Console                  : Area and solar metrics with post-processing stats
 """
 
 import argparse
@@ -18,7 +20,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 
 import cv2
 import numpy as np
@@ -77,10 +79,10 @@ def load_model(model_path: str, device: torch.device) -> UNetResNet34:
         # Assume it's just the state dict
         model.load_state_dict(checkpoint)
 
-    # 🔥 FORCE EVERYTHING TO FLOAT32
+    # FORCE EVERYTHING TO FLOAT32
     model = model.to(device).float()
 
-    # 🔥 EXTRA SAFETY: Ensure all parameters are float32
+    # EXTRA SAFETY: Ensure all parameters are float32
     for param in model.parameters():
         param.data = param.data.float()
 
@@ -161,17 +163,17 @@ def predict(model: UNetResNet34, image_tensor: torch.Tensor) -> torch.Tensor:
         image_tensor: Preprocessed image tensor [1,3,H,W]
 
     Returns:
-        Binary mask tensor [H,W] with values 0 or 1
+        Probability tensor [H,W] with values in [0, 1]
     """
     logger.info("Running inference...")
 
-    # 🔍 DEBUG: Print dtypes and input range
+    # DEBUG: Print dtypes and input range
     print("  Model dtype:", next(model.parameters()).dtype)
     print("  Input dtype:", image_tensor.dtype)
     print("  Input min:", image_tensor.min().item())
     print("  Input max:", image_tensor.max().item())
 
-    # 🔥 EXTRA SAFETY: Ensure float32
+    # EXTRA SAFETY: Ensure float32
     image_tensor = image_tensor.float()
 
     with torch.no_grad():
@@ -181,36 +183,163 @@ def predict(model: UNetResNet34, image_tensor: torch.Tensor) -> torch.Tensor:
         # Apply sigmoid to get probabilities
         probs = torch.sigmoid(logits)
 
-        # 🔍 DEBUG: Print max probability
-        print("  Max probability:", probs.max().item())
-
-        # Threshold at 0.3 to get binary mask (lower threshold for better sensitivity)
-        binary_mask = (probs > 0.3).float()
+        # DEBUG: Print probability range
+        print("  Probability range: [{:.4f}, {:.4f}]".format(probs.min().item(), probs.max().item()))
 
     # Remove batch and channel dimensions -> (H, W)
-    binary_mask = binary_mask.squeeze()
+    probs = probs.squeeze()
 
-    logger.info(f"  Prediction complete. Mask shape: {binary_mask.shape}")
-    return binary_mask
+    logger.info(f"  Prediction complete. Prob shape: {probs.shape}")
+    return probs
 
 
-def postprocess(pred_mask: torch.Tensor) -> np.ndarray:
+def apply_gaussian_smoothing(probs: np.ndarray, kernel_size: Tuple[int, int] = (5, 5), sigma: float = 0) -> np.ndarray:
     """
-    Convert prediction tensor to numpy array.
+    Apply Gaussian smoothing to probability map.
 
     Args:
-        pred_mask: Binary mask tensor [H,W]
+        probs: Probability map [H,W] with values in [0, 1]
+        kernel_size: Gaussian kernel size (default: (5, 5))
+        sigma: Gaussian sigma (default: 0 = auto-computed from kernel size)
 
     Returns:
-        Binary numpy array [H,W] with values 0 or 1
+        Smoothed probability map [H,W]
     """
-    # Move to CPU and convert to numpy
-    mask_np = pred_mask.cpu().numpy()
+    smoothed = cv2.GaussianBlur(probs, kernel_size, sigma)
+    return smoothed
 
-    # Ensure binary values
-    mask_np = (mask_np > 0).astype(np.uint8)
 
-    return mask_np
+def apply_threshold(probs: np.ndarray, threshold: float) -> np.ndarray:
+    """
+    Apply threshold to probability map to get binary mask.
+
+    Args:
+        probs: Probability map [H,W]
+        threshold: Threshold value (0-1)
+
+    Returns:
+        Binary mask [H,W] with values 0 or 1
+    """
+    mask = (probs > threshold).astype(np.uint8)
+    return mask
+
+
+def apply_morphological_cleaning(mask: np.ndarray, kernel_size: int = 3) -> np.ndarray:
+    """
+    Apply morphological opening and closing to clean mask.
+    Opening removes small noise blobs, closing fills small holes.
+
+    Args:
+        mask: Binary mask [H,W] with values 0 or 1
+        kernel_size: Size of morphological kernel (default: 3)
+
+    Returns:
+        Cleaned binary mask [H,W]
+    """
+    kernel = np.ones((kernel_size, kernel_size), np.uint8)
+
+    # Opening: erosion followed by dilation (removes small noise)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+    # Closing: dilation followed by erosion (fills small holes)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    return mask
+
+
+def remove_small_components(
+    mask: np.ndarray,
+    min_area: int = 100,
+    top_k: Optional[int] = None
+) -> Tuple[np.ndarray, int, int]:
+    """
+    Remove small connected components from binary mask.
+    Optionally keep only top-K largest components.
+
+    Args:
+        mask: Binary mask [H,W] with values 0 or 1
+        min_area: Minimum component area in pixels (default: 100)
+        top_k: If specified, keep only top-K largest components (default: None)
+
+    Returns:
+        Tuple of (cleaned_mask, total_components, kept_components)
+    """
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    cleaned_mask = np.zeros_like(mask)
+
+    # Get all component areas (excluding background at index 0)
+    areas = [(i, stats[i, cv2.CC_STAT_AREA]) for i in range(1, num_labels)]
+    total_components = len(areas)
+
+    if total_components == 0:
+        return cleaned_mask, 0, 0
+
+    # Filter by minimum area first
+    valid_components = [(i, area) for i, area in areas if area >= min_area]
+
+    # Optional: Keep only top-K largest components
+    if top_k is not None and len(valid_components) > top_k:
+        valid_components = sorted(valid_components, key=lambda x: x[1], reverse=True)
+        valid_components = valid_components[:top_k]
+
+    # Build clean mask
+    for i, _ in valid_components:
+        cleaned_mask[labels == i] = 1
+
+    kept = len(valid_components)
+    return cleaned_mask, total_components, kept
+
+
+def save_debug_outputs(
+    original: np.ndarray,
+    prob_heatmap: np.ndarray,
+    cleaned_mask: np.ndarray,
+    output_dir: str,
+) -> str:
+    """
+    Save debug visualization with original, probability heatmap, and cleaned mask.
+
+    Args:
+        original: Original image array [H,W,3]
+        prob_heatmap: Probability heatmap [H,W] with values in [0, 1]
+        cleaned_mask: Cleaned binary mask [H,W] with values 0 or 1
+        output_dir: Directory to save outputs
+
+    Returns:
+        Path to saved debug image
+    """
+    # Resize original to match mask size if needed
+    if original.shape[:2] != cleaned_mask.shape:
+        original = cv2.resize(original, (cleaned_mask.shape[1], cleaned_mask.shape[0]))
+
+    # Create 3-panel visualization
+    viz_height = cleaned_mask.shape[0]
+    viz_width = cleaned_mask.shape[1] * 3
+    viz_img = Image.new("RGB", (viz_width, viz_height))
+
+    # Panel 1: Original image
+    original_pil = Image.fromarray(original)
+    viz_img.paste(original_pil, (0, 0))
+
+    # Panel 2: Probability heatmap (convert to colormap)
+    prob_normalized = (prob_heatmap * 255).astype(np.uint8)
+    prob_colored = cv2.applyColorMap(prob_normalized, cv2.COLORMAP_JET)
+    prob_colored = cv2.cvtColor(prob_colored, cv2.COLOR_BGR2RGB)
+    prob_pil = Image.fromarray(prob_colored)
+    viz_img.paste(prob_pil, (cleaned_mask.shape[1], 0))
+
+    # Panel 3: Cleaned binary mask (white on black)
+    mask_rgb = np.zeros((*cleaned_mask.shape, 3), dtype=np.uint8)
+    mask_rgb[cleaned_mask == 1] = [255, 255, 255]
+    mask_pil = Image.fromarray(mask_rgb)
+    viz_img.paste(mask_pil, (cleaned_mask.shape[1] * 2, 0))
+
+    # Save visualization
+    debug_path = os.path.join(output_dir, "debug_prob.png")
+    viz_img.save(debug_path)
+    logger.info(f"  Saved debug visualization: {debug_path}")
+
+    return debug_path
 
 
 def save_outputs(
@@ -278,33 +407,52 @@ def save_outputs(
     return mask_path, viz_path
 
 
-def print_results(area_info: dict, solar_info: dict) -> None:
+def print_results(
+    area_info: dict,
+    solar_info: dict,
+    threshold: float,
+    roof_pixels_pct: float,
+    components_before: int,
+    components_after: int,
+) -> None:
     """
-    Print formatted prediction results.
+    Print formatted prediction results with post-processing stats.
 
     Args:
         area_info: Output from pixels_to_area()
         solar_info: Output from area_to_solar_metrics()
+        threshold: Threshold value used
+        roof_pixels_pct: Percentage of pixels predicted as roof
+        components_before: Number of components before filtering
+        components_after: Number of components after filtering
     """
     # Format currency
     cost_inr = solar_info["estimated_system_cost_inr"]
     cost_formatted = f"₹{cost_inr:,.0f}"
 
-    print("\n" + "=" * 40)
+    print("\n" + "=" * 50)
+    print("===== POST-PROCESSING STATS =====")
+    print("=" * 50)
+    print(f"Threshold used:        {threshold:.2f}")
+    print(f"Roof pixels:           {roof_pixels_pct:.2f}%")
+    print(f"Components before:     {components_before}")
+    print(f"Components after:      {components_after} (removed {components_before - components_after})")
+
+    print("\n" + "=" * 50)
     print("===== PREDICTION RESULTS =====")
-    print("=" * 40)
+    print("=" * 50)
     print(f"Roof pixels:     {area_info['roof_pixels']:,.0f}")
     print(f"Total area:      {area_info['total_roof_area_m2']:,.1f} m²")
     print(f"Usable area:     {area_info['usable_area_m2']:,.1f} m²")
     print()
-    print("=" * 40)
+    print("=" * 50)
     print("===== SOLAR ESTIMATION =====")
-    print("=" * 40)
+    print("=" * 50)
     print(f"Capacity:        {solar_info['system_kw_capacity']:.2f} kW")
     print(f"Annual energy:   {solar_info['annual_kwh']:,.0f} kWh")
     print(f"System cost:     {cost_formatted}")
     print(f"CO₂ saved:       {solar_info['co2_offset_kg_per_year']:,.0f} kg/year")
-    print("=" * 40 + "\n")
+    print("=" * 50 + "\n")
 
 
 def parse_args() -> argparse.Namespace:
@@ -316,6 +464,8 @@ def parse_args() -> argparse.Namespace:
 Examples:
   python predict.py --image_path sample.tif
   python predict.py --image_path sample.tif --gsd 0.3 --state Maharashtra
+  python predict.py --image_path sample.tif --threshold 0.4 --min_area 100 --top_k 20
+  python predict.py --image_path sample.tif --smooth --threshold 0.35
         """,
     )
 
@@ -361,6 +511,41 @@ Examples:
         help="Device to use (cuda/cpu). Auto-detected if not specified.",
     )
 
+    # Post-processing arguments
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.4,
+        help="Confidence threshold for binary mask (default: 0.4)",
+    )
+
+    parser.add_argument(
+        "--min_area",
+        type=int,
+        default=100,
+        help="Minimum component area in pixels (default: 100)",
+    )
+
+    parser.add_argument(
+        "--kernel_size",
+        type=int,
+        default=3,
+        help="Morphological kernel size (default: 3)",
+    )
+
+    parser.add_argument(
+        "--smooth",
+        action="store_true",
+        help="Apply Gaussian smoothing before thresholding",
+    )
+
+    parser.add_argument(
+        "--top_k",
+        type=int,
+        default=None,
+        help="Keep only top-K largest components (default: keep all that pass min_area)",
+    )
+
     return parser.parse_args()
 
 
@@ -382,11 +567,39 @@ def main() -> int:
         # Preprocess image
         image_tensor, original = preprocess(args.image_path, device)
 
-        # Run prediction
-        pred_mask_tensor = predict(model, image_tensor)
+        # Run prediction (get probabilities)
+        probs_tensor = predict(model, image_tensor)
 
-        # Postprocess
-        binary_mask = postprocess(pred_mask_tensor)
+        # Convert to numpy for post-processing
+        probs_np = probs_tensor.cpu().numpy()
+
+        # Step 1: Optional Gaussian smoothing
+        if args.smooth:
+            logger.info("Applying Gaussian smoothing...")
+            probs_np = apply_gaussian_smoothing(probs_np, kernel_size=(5, 5), sigma=0)
+
+        # Step 2: Apply threshold
+        logger.info(f"Applying threshold: {args.threshold}")
+        binary_mask = apply_threshold(probs_np, args.threshold)
+
+        # Calculate roof pixel percentage
+        roof_pixels = np.sum(binary_mask)
+        total_pixels = binary_mask.size
+        roof_pixels_pct = (roof_pixels / total_pixels) * 100
+        logger.info(f"  Pixels predicted as roof: {roof_pixels_pct:.2f}%")
+
+        # Step 3: Morphological cleaning (open/close)
+        logger.info(f"Applying morphological cleaning (kernel_size={args.kernel_size})...")
+        binary_mask = apply_morphological_cleaning(binary_mask, kernel_size=args.kernel_size)
+
+        # Step 4: Remove small components (with optional top-K filtering)
+        logger.info(f"Removing small components (min_area={args.min_area}, top_k={args.top_k})...")
+        binary_mask, components_before, components_after = remove_small_components(
+            binary_mask,
+            min_area=args.min_area,
+            top_k=args.top_k,
+        )
+        logger.info(f"  Components: {components_before} -> {components_after} (removed {components_before - components_after})")
 
         # Calculate area
         logger.info("Calculating area metrics...")
@@ -400,8 +613,18 @@ def main() -> int:
         logger.info(f"Saving outputs to {args.output_dir}/")
         save_outputs(original, binary_mask, args.output_dir)
 
-        # Print results
-        print_results(area_info, solar_info)
+        # Save debug visualization
+        save_debug_outputs(original, probs_np, binary_mask, args.output_dir)
+
+        # Print results with post-processing stats
+        print_results(
+            area_info,
+            solar_info,
+            args.threshold,
+            roof_pixels_pct,
+            components_before,
+            components_after,
+        )
 
         logger.info("Prediction complete!")
         return 0
